@@ -7208,6 +7208,58 @@ class TestSelfSwitchProvenance:
         assert result["switched"] is False or result["to"]["number"] == 1
 
 
+    def test_unresolved_foreign_bytes_matching_another_slot_are_not_backed_up(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Oracle down + live bytes byte-copied from another slot: the local
+        lineage check classifies foreign-synced and the outgoing slot's
+        backup survives. The pre-fix fail-open wrote the other account's
+        only refresh token into it — the split-brain poisoning — even
+        though the state is provable offline (the bytes fingerprint-match
+        the other slot's stored backup).
+        """
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        slot1_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+        }})
+        slot2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000,
+        }})
+        creds_store[("1", "test@example.com")] = slot1_backup
+        creds_store[("2", "account2@example.com")] = slot2_backup
+        configs_store[("1", "test@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com",
+                             "accountUuid": "uuid-1"},
+        })
+        configs_store[("2", "account2@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "account2@example.com",
+                             "accountUuid": "uuid-2"},
+        })
+        # The split-brain: config still names account 1 (mock_claude_config)
+        # while the live store holds slot 2's byte-copied credential.
+        live_state = {"creds": slot2_backup}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch("claude_swap.oauth.fetch_oauth_profile",
+                       return_value=None), \
+                 patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == slot1_backup, (
+            "slot 1's backup must survive: the live bytes were provably "
+            "slot 2's lineage (offline), not slot 1's to capture"
+        )
+        warnings = (result or {}).get("warnings", [])
+        assert any("already matches Account-2" in w for w in warnings), warnings
+
+
 class TestDuplicateAccountDetection:
     def _switcher(self, temp_home, sample_sequence_data):
         switcher = ClaudeAccountSwitcher()
@@ -7466,6 +7518,22 @@ class TestActiveSlotCrossCheck:
         )
         with patches[0], patches[1]:
             assert switcher.current_account_number() == "2"
+
+    def test_steady_state_verdict_reads_one_backup(
+        self, temp_home, sample_sequence_data,
+    ):
+        """current_account_number() confirms an agreeing config with a SINGLE
+        backup read — the auto-switch engine calls it several times per
+        tick, so the full O(slots) sweep is reserved for actual divergence."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-1"),
+        )
+        with patches[0], patches[1] as ex_mock:
+            assert switcher.current_account_number() == "1"
+        assert ex_mock.call_count == 1
+        assert ex_mock.call_args[0][0] == "1"
 
     def test_current_account_number_still_none_for_unmanaged_login(
         self, temp_home, sample_sequence_data,

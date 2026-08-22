@@ -1959,7 +1959,7 @@ class ClaudeAccountSwitcher:
         if not data.get("sequence"):
             return config_slot
         live = self._read_active_credentials()
-        slot, _mismatch, _backups = self._resolve_active_slot(
+        slot, _mismatch = self._resolve_active_slot(
             data, identity, config_slot, live
         )
         return slot
@@ -3784,8 +3784,10 @@ class ClaudeAccountSwitcher:
         active = self._read_active_credentials()
         live_creds = active.value or ""
 
-        active_num, mismatch, backups = self._resolve_active_slot(
-            data, current_identity, config_slot, active
+        backups, backups_unreadable = self._read_all_backups(data)
+        active_num, mismatch = self._resolve_active_slot(
+            data, current_identity, config_slot, active,
+            backups=backups, backups_unreadable=backups_unreadable,
         )
         if mismatch:
             self._record_active_mismatch(mismatch)
@@ -3814,7 +3816,9 @@ class ClaudeAccountSwitcher:
         config_identity: tuple[str, str] | None,
         config_slot: str | None,
         live,
-    ) -> tuple[str | None, dict | None, dict[str, str]]:
+        backups: dict[str, str] | None = None,
+        backups_unreadable: bool = False,
+    ) -> tuple[str | None, dict | None]:
         """Cross-check the config-named active slot against the live lineage.
 
         The config identity (``oauthAccount``) names a slot, but every running
@@ -3846,24 +3850,37 @@ class ClaudeAccountSwitcher:
         ``_classify_outgoing_credential``, which decides who owns the live
         bytes rather than which slot is named.)
 
-        Returns ``(slot, mismatch_note, backups)``. ``backups`` (slot →
-        stored credential) rides along so ``_build_accounts_info``, which
-        needs every backup anyway for its per-account rows, doesn't read the
-        Keychain twice.
-        """
-        backups: dict[str, str] = {}
-        unreadable = False
-        for num in data.get("sequence", []):
-            account = data.get("accounts", {}).get(str(num), {})
-            value, failed = self._read_account_credentials_ex(
-                str(num), account.get("email", "unknown")
-            )
-            backups[str(num)] = value
-            unreadable = unreadable or failed
+        ``backups``/``backups_unreadable``: a caller that needs every backup
+        anyway for its own output (``_build_accounts_info``'s per-account
+        rows) pre-reads them once and passes them in. A caller that only
+        needs the verdict (``current_account_number``, called several times
+        per auto-switch tick) omits them, and the resolver reads as little as
+        the verdict needs: in the steady state — the live lineage confirms
+        the config-named slot — that is ONE backup read, and the full sweep
+        runs only on actual divergence. Without the fast path every tick
+        paid O(slots) ``security`` subprocess spawns for a verdict that
+        almost always says "the config was right".
 
+        Returns ``(slot, mismatch_note)``.
+        """
         live_fp = oauth.credential_fingerprint(live.value or "")
-        if not live_fp or live.degraded or unreadable:
-            return config_slot, None, backups
+        if not live_fp or live.degraded:
+            return config_slot, None
+
+        accounts = data.get("accounts", {})
+        if backups is None:
+            if config_slot is not None:
+                value, failed = self._read_account_credentials_ex(
+                    config_slot, accounts.get(config_slot, {}).get("email", "unknown")
+                )
+                if failed:
+                    return config_slot, None  # incomplete evidence
+                if value and oauth.credential_fingerprint(value) == live_fp:
+                    return config_slot, None  # steady state: config confirmed
+            backups, backups_unreadable = self._read_all_backups(data)
+
+        if backups_unreadable:
+            return config_slot, None
         owners = [
             snum for snum, creds in backups.items()
             if creds and oauth.credential_fingerprint(creds) == live_fp
@@ -3874,8 +3891,21 @@ class ClaudeAccountSwitcher:
                 "configSlot": config_slot,
                 "activeSlot": owners[0],
             }
-            return owners[0], note, backups
-        return config_slot, None, backups
+            return owners[0], note
+        return config_slot, None
+
+    def _read_all_backups(self, data: dict) -> tuple[dict[str, str], bool]:
+        """Every slot's stored backup plus whether any read was unreadable."""
+        backups: dict[str, str] = {}
+        unreadable = False
+        for num in data.get("sequence", []):
+            account = data.get("accounts", {}).get(str(num), {})
+            value, failed = self._read_account_credentials_ex(
+                str(num), account.get("email", "unknown")
+            )
+            backups[str(num)] = value
+            unreadable = unreadable or failed
+        return backups, unreadable
 
     def _active_mismatch_warning(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
@@ -6232,9 +6262,13 @@ class ClaudeAccountSwitcher:
           here would destroy this slot's only refresh token (issue #117's
           poisoning). Preserved in a safety copy, never written into any
           slot: identity proves ownership, not generation freshness.
-        - ``"foreign-synced"`` — resolved to another managed slot whose
-          stored backup already holds this exact lineage; nothing needs
-          preserving, nothing may be written.
+        - ``"foreign-synced"`` — another managed slot's stored backup already
+          holds this exact lineage; nothing needs preserving, nothing may be
+          written. Established by the oracle, or — when the oracle is silent
+          — locally, by fingerprint match against the other slots' backups:
+          the split-brain state is byte-copied, so it is provable offline,
+          and conceding "unresolved" there let the fail-open backup poison
+          the config-named slot with another account's only refresh token.
         - ``"wiped"``          — an OAuth blob whose token fields are all
           empty: Claude Code's ``invalid_grant`` reaction empties
           ``accessToken``/``refreshToken`` in place, keeping the wrapper and
@@ -6281,6 +6315,25 @@ class ClaudeAccountSwitcher:
             return ("wiped", None)
         resolved = provenance.get("resolved")
         if resolved is None or provenance.get("live") != original_creds:
+            # LOCAL lineage evidence before conceding "unresolved": bytes
+            # whose refresh-token lineage matches another managed slot's
+            # stored backup are that slot's — the same offline proof
+            # _resolve_active_slot uses, and it needs no oracle. This closes
+            # the split-brain poisoning the fail-open below could still
+            # commit: config names slot A, the live store holds slot B's
+            # byte-copied credential, the profile probe is down — the
+            # pre-fix backup would write B's only refresh token into A.
+            # Local reads only (the switch locks are held; no network).
+            live_fp = oauth.credential_fingerprint(original_creds)
+            if live_fp:
+                for num, acct in data.get("accounts", {}).items():
+                    if num == current_account:
+                        continue
+                    other = self._read_account_credentials(
+                        num, acct.get("email", "")
+                    )
+                    if other and oauth.credential_fingerprint(other) == live_fp:
+                        return ("foreign-synced", num)
             if self._probe_verdicts.get(
                 self._lineage_key(
                     current_account, current_email,
