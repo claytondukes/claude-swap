@@ -152,8 +152,12 @@ class EngineHarness:
         self.switcher._write_json(self.switcher.sequence_file, data)
 
     def make_live(self, email: str, num: int) -> None:
+        # The account's OWN seeded lineage, exactly like a real `/login`:
+        # active-slot resolution is lineage-corrected (`_resolve_active_slot`),
+        # so a shared sentinel credential would stop matching the config
+        # identity the moment any switch captured it into a slot's backup.
         (self.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+            "claudeAiOauth": {"accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"},
         }))
         (self.temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},

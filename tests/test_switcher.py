@@ -7454,6 +7454,32 @@ class TestActiveSlotCrossCheck:
         assert "another identity" not in msg
         assert str(switcher._get_claude_config_path()) in msg
 
+    def test_current_account_number_shares_the_lineage_verdict(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The auto-switch engine's 'current' must agree with list's (active):
+        both route through _resolve_active_slot."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        with patches[0], patches[1]:
+            assert switcher.current_account_number() == "2"
+
+    def test_current_account_number_still_none_for_unmanaged_login(
+        self, temp_home, sample_sequence_data,
+    ):
+        """An unmanaged live login matches no backup lineage — the engine's
+        never-guess contract survives the correction."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "someone-else@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-unmanaged"),
+        )
+        with patches[0], patches[1]:
+            assert switcher.current_account_number() is None
+
     def test_mismatch_note_reaches_json_payload(
         self, temp_home, sample_sequence_data,
     ):
@@ -9430,7 +9456,13 @@ class TestSwitchUnreadableBackup:
             "accessToken": "sk-live", "refreshToken": "rt-live",
             "expiresAt": 9999999999000}})
         s._store._write_active_credentials_file(live)
-        s._write_account_credentials("2", "account2@example.com", live)
+        # Slot 2's backup carries its OWN lineage: byte-sharing the live
+        # credential would make the lineage-corrected active resolution
+        # (rightly) call slot 2 active and defeat this test's premise.
+        s._write_account_credentials("2", "account2@example.com", json.dumps(
+            {"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2",
+                "expiresAt": 9999999999000}}))
         s._write_account_config("2", "account2@example.com", json.dumps(
             {"oauthAccount": {"emailAddress": "account2@example.com",
                               "accountUuid": "uuid-2",

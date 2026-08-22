@@ -1939,13 +1939,30 @@ class ClaudeAccountSwitcher:
         overwrite a login cswap doesn't own (``_perform_switch`` would take
         the no-backup direct-activation path). Use :meth:`has_live_login` to
         tell the two ``None`` cases apart.
+
+        Lineage-corrected through :meth:`_resolve_active_slot`, the same
+        verdict ``_build_accounts_info`` uses: when the live credential
+        provably belongs to exactly one managed slot, that slot is the answer
+        even while a still-running old session keeps rewriting
+        ``oauthAccount`` — otherwise the auto-switch engine evaluates a
+        different account's quota than the one the live token actually draws
+        from, and can rotate away from (or fail to rotate away from) the
+        wrong account. A genuinely unmanaged live login still returns
+        ``None``: its lineage matches no stored backup.
         """
         identity = self._get_current_account()
-        if identity is None:
-            return None
         data = self._get_sequence_data() or {}
-        email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        config_slot = None
+        if identity is not None:
+            email, org_uuid = identity
+            config_slot = self._find_account_slot(data, email, org_uuid)
+        if not data.get("sequence"):
+            return config_slot
+        live = self._read_active_credentials()
+        slot, _mismatch, _backups = self._resolve_active_slot(
+            data, identity, config_slot, live
+        )
+        return slot
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -3742,32 +3759,22 @@ class ClaudeAccountSwitcher:
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
 
-        Active-slot detection cross-checks two independent signals. The config
-        identity (``~/.claude.json``'s ``oauthAccount``) names a slot, but every
-        running Claude Code session periodically rewrites that file with its own
-        cached identity — after a switch, a still-running session for the *old*
-        account flips it back while the live store already holds the new
-        account's token. Trusting the config alone then attributes the live
-        bytes to the wrong slot: the wrong row is marked active, the duplicate
-        detector reports a phantom "same credential" collision against the slot
-        the bytes actually belong to, and the truly-active slot's backup is
-        exempted from the collect pass's keep-alive refresh. The live credential
-        is what new work authenticates as, so when its lineage matches exactly
-        one slot's stored backup, that slot wins and the mismatch is recorded
-        (``_active_mismatch``) for the caller to surface. No match (a full
-        rotation ahead of every backup, or an alien login), multi-slot
-        matches (a genuine duplicate), an unreadable backup and a degraded
-        live read all keep the config's answer: no positive and complete
-        evidence, no override.
+        Active-slot detection is lineage-corrected via
+        :meth:`_resolve_active_slot` — the config identity names a slot, but
+        the live credential's lineage is the deciding evidence, and every
+        consumer of "which slot is active" (this builder, and
+        :meth:`current_account_number` for the auto-switch engine) must share
+        that one verdict or automation acts on a different account than the
+        display shows.
         """
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
-        active_num = None
+        config_slot = None
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
-            active_num = self._find_account_slot(data, current_email, current_org_uuid)
+            config_slot = self._find_account_slot(data, current_email, current_org_uuid)
 
         # Reset each build; the verdict is set below only when an active row
         # exists. Read by _static_usage_sentinel (main thread writes it here
@@ -3777,35 +3784,11 @@ class ClaudeAccountSwitcher:
         active = self._read_active_credentials()
         live_creds = active.value or ""
 
-        backups: dict[str, str] = {}
-        backups_unreadable = False
-        for num in data.get("sequence", []):
-            account = data.get("accounts", {}).get(str(num), {})
-            value, unreadable = self._read_account_credentials_ex(
-                str(num), account.get("email", "unknown")
-            )
-            backups[str(num)] = value
-            backups_unreadable = backups_unreadable or unreadable
-
-        # The override needs COMPLETE evidence. An unreadable backup is not
-        # a non-match — the hidden slot could be the live lineage's real
-        # owner, and overriding around it would misattribute during exactly
-        # the corrupted/locked states this check exists to untangle. A
-        # degraded live read may likewise serve a stale generation. Either
-        # condition keeps the config's answer.
-        live_fp = oauth.credential_fingerprint(live_creds)
-        if live_fp and not backups_unreadable and not active.degraded:
-            owners = [
-                snum for snum, creds in backups.items()
-                if creds and oauth.credential_fingerprint(creds) == live_fp
-            ]
-            if len(owners) == 1 and owners[0] != active_num:
-                self._record_active_mismatch({
-                    "configEmail": current_identity[0] if current_identity else None,
-                    "configSlot": active_num,
-                    "activeSlot": owners[0],
-                })
-                active_num = owners[0]
+        active_num, mismatch, backups = self._resolve_active_slot(
+            data, current_identity, config_slot, active
+        )
+        if mismatch:
+            self._record_active_mismatch(mismatch)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         for num in data.get("sequence", []):
@@ -3824,6 +3807,75 @@ class ClaudeAccountSwitcher:
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
+
+    def _resolve_active_slot(
+        self,
+        data: dict,
+        config_identity: tuple[str, str] | None,
+        config_slot: str | None,
+        live,
+    ) -> tuple[str | None, dict | None, dict[str, str]]:
+        """Cross-check the config-named active slot against the live lineage.
+
+        The config identity (``oauthAccount``) names a slot, but every running
+        Claude Code session periodically rewrites that file with its own
+        cached identity — after a switch, a still-running session for the
+        *old* account flips it back while the live store already holds the
+        new account's token. Trusting the config alone then attributes the
+        live bytes to the wrong slot: the wrong row is marked active, the
+        duplicate detector reports a phantom "same credential" collision
+        against the slot the bytes actually belong to, the truly-active
+        slot's backup is exempted from the collect pass's keep-alive refresh,
+        and the auto-switch engine evaluates the wrong account's quota. The
+        live credential is what new work authenticates as, so when its
+        lineage matches exactly one slot's stored backup, that slot wins.
+
+        The override needs COMPLETE evidence. No match (a full rotation ahead
+        of every backup, or an alien login) and multi-slot matches (a genuine
+        duplicate) keep the config's answer. An unreadable backup is not a
+        non-match — the hidden slot could be the live lineage's real owner —
+        and a degraded live read may serve a stale generation: either
+        condition also keeps the config's answer.
+
+        This is the ONE place the verdict is computed; every consumer of
+        "which slot is active" (``_build_accounts_info``,
+        ``current_account_number``) must route through it so the display,
+        the usage collectors and the auto-switch engine can never disagree.
+        (The switch path deliberately does not: its outgoing-backup safety is
+        the identity-oracle classification in
+        ``_classify_outgoing_credential``, which decides who owns the live
+        bytes rather than which slot is named.)
+
+        Returns ``(slot, mismatch_note, backups)``. ``backups`` (slot →
+        stored credential) rides along so ``_build_accounts_info``, which
+        needs every backup anyway for its per-account rows, doesn't read the
+        Keychain twice.
+        """
+        backups: dict[str, str] = {}
+        unreadable = False
+        for num in data.get("sequence", []):
+            account = data.get("accounts", {}).get(str(num), {})
+            value, failed = self._read_account_credentials_ex(
+                str(num), account.get("email", "unknown")
+            )
+            backups[str(num)] = value
+            unreadable = unreadable or failed
+
+        live_fp = oauth.credential_fingerprint(live.value or "")
+        if not live_fp or live.degraded or unreadable:
+            return config_slot, None, backups
+        owners = [
+            snum for snum, creds in backups.items()
+            if creds and oauth.credential_fingerprint(creds) == live_fp
+        ]
+        if len(owners) == 1 and owners[0] != config_slot:
+            note = {
+                "configEmail": config_identity[0] if config_identity else None,
+                "configSlot": config_slot,
+                "activeSlot": owners[0],
+            }
+            return owners[0], note, backups
+        return config_slot, None, backups
 
     def _active_mismatch_warning(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
