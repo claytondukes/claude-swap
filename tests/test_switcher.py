@@ -979,6 +979,8 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
@@ -1007,6 +1009,8 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             switcher.list_accounts()
 
@@ -1039,6 +1043,8 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
@@ -1057,7 +1063,9 @@ class TestListAccountsUsage:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         with patch.object(switcher, "_read_credentials", return_value=""), \
-             patch.object(switcher, "_read_account_credentials", return_value=""):
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          return_value=("", False)):
             switcher.list_accounts()
 
         output = capsys.readouterr().out
@@ -1102,6 +1110,8 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
              patch.object(switcher, "consume_backup_grant", side_effect=mock_gate), \
@@ -1126,6 +1136,8 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
              patch("claude_swap.session.read_session_credentials", return_value=None), \
              patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes"):
@@ -1274,6 +1286,8 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             switcher.list_accounts()
 
@@ -1315,6 +1329,8 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
@@ -1345,6 +1361,8 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)):
             switcher.list_accounts()
@@ -1390,6 +1408,8 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
@@ -1436,6 +1456,10 @@ class TestListAccountsUsage:
             return_value=ActiveCredentials(active_creds, False),
         ), patch.object(
             switcher, "_read_account_credentials", return_value=backup_creds
+        ), patch.object(
+            switcher,
+            "_read_account_credentials_ex",
+            side_effect=lambda num, email: (backup_creds, False),
         ), patch(
             "claude_swap.oauth.try_fetch_usage_for_account",
             return_value=oauth.UsageOutcome(refreshed),
@@ -1537,6 +1561,8 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts(fetch=set())
@@ -1546,6 +1572,8 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts(fetch={"2"})
@@ -4474,6 +4502,8 @@ class TestUpgradeMigration:
         with patch.object(switcher, "_write_credentials"), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex",
+                          side_effect=lambda num, email: (backup_creds, False)), \
              patch.object(switcher, "_read_account_config", return_value=json.dumps({
                  "oauthAccount": {
                      "emailAddress": "other@example.com",
@@ -7256,7 +7286,10 @@ class TestActiveSlotCrossCheck:
             "accessToken": f"sk-{rt}", "refreshToken": rt,
         }})
 
-    def _switcher(self, temp_home, sample_sequence_data, config_email, backups, live):
+    def _switcher(
+        self, temp_home, sample_sequence_data, config_email, backups, live,
+        unreadable=(),
+    ):
         (temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": config_email, "accountUuid": "u"},
         }))
@@ -7269,8 +7302,10 @@ class TestActiveSlotCrossCheck:
                 return_value=ActiveCredentials(live, False, False),
             ),
             patch.object(
-                switcher, "_read_account_credentials",
-                side_effect=lambda num, email: backups.get(str(num), ""),
+                switcher, "_read_account_credentials_ex",
+                side_effect=lambda num, email: (
+                    backups.get(str(num), ""), str(num) in unreadable
+                ),
             ),
         ]
         return switcher, patches
@@ -7301,6 +7336,8 @@ class TestActiveSlotCrossCheck:
         assert switcher._duplicate_account_warnings(info) == []
         msg = switcher._active_mismatch_warning(info)
         assert "Account-2" in msg and "account1@example.com" in msg
+        # The message names the RESOLVED config path, not a hardcoded one.
+        assert str(switcher._get_claude_config_path()) in msg
 
     def test_agreeing_config_records_no_mismatch(
         self, temp_home, sample_sequence_data,
@@ -7361,6 +7398,61 @@ class TestActiveSlotCrossCheck:
         note = switcher._active_mismatch()
         assert note["configSlot"] is None
         assert note["activeSlot"] == "2"
+
+    def test_unreadable_backup_suppresses_the_override(
+        self, temp_home, sample_sequence_data,
+    ):
+        """An unreadable slot could be the live lineage's real owner —
+        incomplete evidence keeps the config's answer."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": "", "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+            unreadable=("1",),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [True, False]
+        assert switcher._active_mismatch() is None
+
+    def test_degraded_live_read_suppresses_the_override(
+        self, temp_home, sample_sequence_data,
+    ):
+        """A degraded live read may serve a stale generation — its lineage
+        match is not evidence of who is active now."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        patches[0] = patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(self._creds("rt-2"), False, True),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [True, False]
+        assert switcher._active_mismatch() is None
+
+    def test_missing_config_identity_gets_the_no_login_wording(
+        self, temp_home, sample_sequence_data,
+    ):
+        """configEmail=None means the config records no login — the message
+        must not claim it 'names another identity'."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "someone-else@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        switcher._record_active_mismatch(
+            {"configEmail": None, "configSlot": None, "activeSlot": "2"}
+        )
+        msg = switcher._active_mismatch_warning(info)
+        assert "records no login" in msg
+        assert "another identity" not in msg
+        assert str(switcher._get_claude_config_path()) in msg
 
     def test_mismatch_note_reaches_json_payload(
         self, temp_home, sample_sequence_data,

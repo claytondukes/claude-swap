@@ -75,6 +75,7 @@ class TestActiveWriteCoversResolvedServices:
         store = macos_switcher._store
         store._keychain_usable_cache = True
         calls: list[str] = []
+        monkeypatch.setattr(_kc, "get_password", lambda service, account: None)
         monkeypatch.setattr(
             _kc, "set_password", lambda service, account, value: calls.append(service)
         )
@@ -130,12 +131,16 @@ class TestActiveWriteCoversResolvedServices:
             CLAUDE_CODE_KEYCHAIN_SERVICE,
         ]
 
-    def test_partial_write_failure_falls_back_to_the_file(
+    def test_partial_write_failure_undoes_the_written_service(
         self, macos_switcher, monkeypatch, temp_home
     ):
-        """Second-service failure must not leave a half-updated keychain as
-        the recorded backend: the file fallback (whose delete sweep clears
-        every resolved item) takes over, exactly like a first-service failure.
+        """Second-service failure must not leave the keychain split-brained.
+
+        If the suffixed item took the new credential and the unsuffixed write
+        then failed, one environment would read the new account and the other
+        the old one — even a subsequent file-write failure must not leave
+        that state behind. The undo restores the written item to its prior
+        value before the file fallback runs.
         """
         from claude_swap import macos_keychain as _kc
         from claude_swap.session import keychain_service_name
@@ -146,16 +151,50 @@ class TestActiveWriteCoversResolvedServices:
         store._keychain_usable_cache = True
 
         suffixed = keychain_service_name(exported)
+        PRIOR = '{"claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old"}}'
+        writes: list[tuple[str, str]] = []
+
+        def set_password(service, account, value):
+            if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                raise _kc.KeychainError("locked")
+            writes.append((service, value))
+
+        monkeypatch.setattr(_kc, "get_password", lambda service, account: PRIOR)
+        monkeypatch.setattr(_kc, "set_password", set_password)
+        monkeypatch.setattr(_kc, "delete_password", lambda service, account: None)
+        store._write_oauth_credentials(self.OAUTH)
+        assert store._last_active_credentials_backend == "file"
+        # New credential in, then the undo put the PRIOR value back.
+        assert writes == [(suffixed, self.OAUTH), (suffixed, PRIOR)]
+
+    def test_partial_write_undo_deletes_an_item_that_had_no_prior(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        """A written item with no prior value is deleted by the undo, not
+        left holding the new credential."""
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.session import keychain_service_name
+
+        exported = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        suffixed = keychain_service_name(exported)
+        deleted: list[str] = []
 
         def set_password(service, account, value):
             if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
                 raise _kc.KeychainError("locked")
 
+        monkeypatch.setattr(_kc, "get_password", lambda service, account: None)
         monkeypatch.setattr(_kc, "set_password", set_password)
-        monkeypatch.setattr(_kc, "delete_password", lambda service, account: None)
+        monkeypatch.setattr(
+            _kc, "delete_password", lambda service, account: deleted.append(service)
+        )
         store._write_oauth_credentials(self.OAUTH)
         assert store._last_active_credentials_backend == "file"
-        assert suffixed  # the suffixed write succeeded, then was superseded
+        assert suffixed in deleted
 
 
 class TestBackupCredentialsSecurity:

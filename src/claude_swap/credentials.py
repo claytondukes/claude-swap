@@ -1003,22 +1003,33 @@ class CredentialStore:
             CredentialWriteError: If writing credentials fails.
         """
         if self._use_keychain():
+            account = macos_keychain.keychain_account_name()
+            # (service, prior value) for each item already updated this call —
+            # the undo list for a partial multi-service write.
+            written: list[tuple[str, str | None]] = []
             try:
-                # Every service the active environment's read path resolves —
-                # a partial write (some services updated, one failed) drops to
-                # the file path below, whose delete sweep clears them all, so
-                # the stores can't be left telling two different stories.
+                # Every service the active environment's read path resolves.
+                # Prior values are captured first so a later service failing
+                # can UNDO the earlier writes: without the undo, one item
+                # serves the new account while another still serves the old
+                # one, and which account a reader sees depends on its
+                # environment — the exact split this multi-service write
+                # exists to prevent. The file path below also sweeps every
+                # item, but only after ITS write succeeds; consistency must
+                # not depend on that.
                 for service in _active_oauth_keychain_write_services():
-                    self._kc_call(
-                        macos_keychain.set_password,
-                        service,
-                        macos_keychain.keychain_account_name(),
-                        credentials,
+                    prior = self._kc_call(
+                        macos_keychain.get_password, service, account
                     )
+                    self._kc_call(
+                        macos_keychain.set_password, service, account, credentials
+                    )
+                    written.append((service, prior))
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)
                 self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
+                self._undo_partial_keychain_write(written)
             else:
                 # Keychain (primary) now holds the fresh credential. Bump an
                 # already-present shadow file's mtime so running sessions hot-reload
@@ -1044,6 +1055,28 @@ class CredentialStore:
             # authority, so hand it over rather than re-deriving it from flags.
             self._pin_file_mode(residual_cleared=cleared)
         self._last_active_credentials_backend = "file"
+
+    def _undo_partial_keychain_write(
+        self, written: list[tuple[str, str | None]]
+    ) -> None:
+        """Best-effort undo after a multi-service write failed partway through.
+
+        Restores each already-updated item to its prior value (deleting one
+        that had none) so no two services tell different stories while the
+        caller falls back to the file. Raw ``macos_keychain`` calls, each
+        independently best-effort: the capability cache has already flipped,
+        and a failed undo leaves at worst the pre-undo state — the file path's
+        delete sweep still runs after a successful file write.
+        """
+        account = macos_keychain.keychain_account_name()
+        for service, prior in written:
+            try:
+                if prior:
+                    macos_keychain.set_password(service, account, prior)
+                else:
+                    macos_keychain.delete_password(service, account)
+            except Exception:
+                continue
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
         """Bump an already-present ``.credentials.json``'s mtime after a Keychain write.

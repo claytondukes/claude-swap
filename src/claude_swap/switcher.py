@@ -3755,8 +3755,9 @@ class ClaudeAccountSwitcher:
         is what new work authenticates as, so when its lineage matches exactly
         one slot's stored backup, that slot wins and the mismatch is recorded
         (``_active_mismatch``) for the caller to surface. No match (a full
-        rotation ahead of every backup, or an alien login) and multi-slot
-        matches (a genuine duplicate) keep the config's answer: no positive
+        rotation ahead of every backup, or an alien login), multi-slot
+        matches (a genuine duplicate), an unreadable backup and a degraded
+        live read all keep the config's answer: no positive and complete
         evidence, no override.
         """
         data = self._get_sequence_data_migrated() or {}
@@ -3777,14 +3778,23 @@ class ClaudeAccountSwitcher:
         live_creds = active.value or ""
 
         backups: dict[str, str] = {}
+        backups_unreadable = False
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
-            backups[str(num)] = self._read_account_credentials(
+            value, unreadable = self._read_account_credentials_ex(
                 str(num), account.get("email", "unknown")
             )
+            backups[str(num)] = value
+            backups_unreadable = backups_unreadable or unreadable
 
+        # The override needs COMPLETE evidence. An unreadable backup is not
+        # a non-match — the hidden slot could be the live lineage's real
+        # owner, and overriding around it would misattribute during exactly
+        # the corrupted/locked states this check exists to untangle. A
+        # degraded live read may likewise serve a stale generation. Either
+        # condition keeps the config's answer.
         live_fp = oauth.credential_fingerprint(live_creds)
-        if live_fp:
+        if live_fp and not backups_unreadable and not active.degraded:
             owners = [
                 snum for snum, creds in backups.items()
                 if creds and oauth.credential_fingerprint(creds) == live_fp
@@ -3826,13 +3836,22 @@ class ClaudeAccountSwitcher:
         email = next(
             (info[1] for info in accounts_info if str(info[0]) == slot), ""
         )
-        config_desc = note.get("configEmail") or "another identity"
+        config_path = self._get_claude_config_path()
+        if note.get("configEmail"):
+            lead = (
+                f"{config_path} names {note['configEmail']} as the login, but "
+                f"the live credential is Account-{slot}'s ({email}) — most "
+                "likely a still-running Claude session for the old account "
+                "rewrote the config after a switch."
+            )
+        else:
+            lead = (
+                f"{config_path} records no login, but the live credential is "
+                f"Account-{slot}'s ({email})."
+            )
         return (
-            f"~/.claude.json names {config_desc} as the login, but the live "
-            f"credential is Account-{slot}'s ({email}) — most likely a "
-            "still-running Claude session for the old account rewrote the "
-            f"config after a switch. Treating Account-{slot} as active; new "
-            f"sessions will authenticate as {email}."
+            f"{lead} Treating Account-{slot} as active; new sessions will "
+            f"authenticate as {email}."
         )
 
     def _fetch_active_usage(
