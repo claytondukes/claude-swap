@@ -348,6 +348,14 @@ class ClaudeAccountSwitcher:
         # the consume gate POSTs a possibly-spent grant.
         self._active_verdict_tls = threading.local()
 
+        # Active-slot cross-check outcome, PER THREAD (same two-lane rationale
+        # as the verdict above). Set by _build_accounts_info when the live
+        # credential's lineage proves the config-named active slot wrong;
+        # consumed by list_accounts / the JSON payload to explain the
+        # split-brain instead of letting it surface as a phantom
+        # duplicate-credential warning.
+        self._active_mismatch_tls = threading.local()
+
         # Accounts already warned about a provenance problem with the active
         # credential — each condition persists across collect passes and
         # would otherwise log every tick. Cleared when its condition clears.
@@ -686,8 +694,11 @@ class ClaudeAccountSwitcher:
         profile's possibly-stale plaintext seed — and rather than reaching the
         fallbacks below, which belong to other stores entirely.
 
-        Read-only. cswap does not write claude's hashed keychain entry — see
-        the ``session`` module docstring for why.
+        Read-only. cswap never seeds a hashed keychain entry for a profile it
+        is not running in — see the ``session`` module docstring for why. (The
+        *active* environment's hashed entry is different: the live-store write
+        path keeps it in sync — ``_active_oauth_keychain_write_services`` —
+        because it is the item claude actually reads here.)
         """
         from claude_swap.session import read_config_dir_credentials
 
@@ -2609,6 +2620,14 @@ class ClaudeAccountSwitcher:
         """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""
         self._active_verdict_tls.value = active
 
+    def _record_active_mismatch(self, note: dict | None) -> None:
+        """Record THIS thread's active-slot mismatch (see `_active_mismatch_tls`)."""
+        self._active_mismatch_tls.value = note
+
+    def _active_mismatch(self) -> dict | None:
+        """This thread's active-slot mismatch note from the last build, if any."""
+        return getattr(self._active_mismatch_tls, "value", None)
+
     def _with_active_verdict(self, fn):
         """Wrap `fn` so a worker thread inherits THIS thread's verdict.
 
@@ -3722,6 +3741,23 @@ class ClaudeAccountSwitcher:
         slot is detected and credentials are read in exactly one place. The
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
+
+        Active-slot detection cross-checks two independent signals. The config
+        identity (``~/.claude.json``'s ``oauthAccount``) names a slot, but every
+        running Claude Code session periodically rewrites that file with its own
+        cached identity — after a switch, a still-running session for the *old*
+        account flips it back while the live store already holds the new
+        account's token. Trusting the config alone then attributes the live
+        bytes to the wrong slot: the wrong row is marked active, the duplicate
+        detector reports a phantom "same credential" collision against the slot
+        the bytes actually belong to, and the truly-active slot's backup is
+        exempted from the collect pass's keep-alive refresh. The live credential
+        is what new work authenticates as, so when its lineage matches exactly
+        one slot's stored backup, that slot wins and the mismatch is recorded
+        (``_active_mismatch``) for the caller to surface. No match (a full
+        rotation ahead of every backup, or an alien login) and multi-slot
+        matches (a genuine duplicate) keep the config's answer: no positive
+        evidence, no override.
         """
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
@@ -3732,11 +3768,36 @@ class ClaudeAccountSwitcher:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
-        accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
-        # Reset each build; set below only when the active slot's OAuth Keychain
-        # read failed with no fallback. Read by _static_usage_sentinel (main
-        # thread writes it here before the fetch pool starts → no data race).
+        # Reset each build; the verdict is set below only when an active row
+        # exists. Read by _static_usage_sentinel (main thread writes it here
+        # before the fetch pool starts → no data race).
         self._record_active_verdict(None)
+        self._record_active_mismatch(None)
+        active = self._read_active_credentials()
+        live_creds = active.value or ""
+
+        backups: dict[str, str] = {}
+        for num in data.get("sequence", []):
+            account = data.get("accounts", {}).get(str(num), {})
+            backups[str(num)] = self._read_account_credentials(
+                str(num), account.get("email", "unknown")
+            )
+
+        live_fp = oauth.credential_fingerprint(live_creds)
+        if live_fp:
+            owners = [
+                snum for snum, creds in backups.items()
+                if creds and oauth.credential_fingerprint(creds) == live_fp
+            ]
+            if len(owners) == 1 and owners[0] != active_num:
+                self._record_active_mismatch({
+                    "configEmail": current_identity[0] if current_identity else None,
+                    "configSlot": active_num,
+                    "activeSlot": owners[0],
+                })
+                active_num = owners[0]
+
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -3746,14 +3807,33 @@ class ClaudeAccountSwitcher:
             is_active = str(num) == active_num
 
             if is_active:
-                active = self._read_active_credentials()
-                creds = active.value or ""
+                creds = live_creds
                 self._record_active_verdict(active)
             else:
-                creds = self._read_account_credentials(str(num), email)
+                creds = backups[str(num)]
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
+
+    def _active_mismatch_warning(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+    ) -> str | None:
+        """Human-readable line for this thread's active-slot mismatch, if any."""
+        note = self._active_mismatch()
+        if not note:
+            return None
+        slot = note["activeSlot"]
+        email = next(
+            (info[1] for info in accounts_info if str(info[0]) == slot), ""
+        )
+        config_desc = note.get("configEmail") or "another identity"
+        return (
+            f"~/.claude.json names {config_desc} as the login, but the live "
+            f"credential is Account-{slot}'s ({email}) — most likely a "
+            "still-running Claude session for the old account rewrote the "
+            f"config after a switch. Treating Account-{slot} as active; new "
+            f"sessions will authenticate as {email}."
+        )
 
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
@@ -5006,6 +5086,12 @@ class ClaudeAccountSwitcher:
         offline-detectable here — ``_lockstep_usage_warnings`` covers that
         case heuristically. The switch-time guard prevents new occurrences
         whenever the identity oracle answers.
+
+        The phantom variant of this collision — live bytes attributed to a
+        stale config-named slot while they are really another slot's own
+        credential — is prevented upstream: ``_build_accounts_info``
+        cross-checks the config identity against the live credential's
+        lineage before deciding which row reads the live store.
         """
         data = self._get_sequence_data() or {}
         by_fp: dict[str, str] = {}
@@ -5129,6 +5215,9 @@ class ClaudeAccountSwitcher:
         }
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
+        mismatch_note = self._active_mismatch()
+        if mismatch_note:
+            payload["activeSlotMismatch"] = dict(mismatch_note)
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         if dup_warnings:
             payload["duplicateAccountWarnings"] = dup_warnings
@@ -5198,10 +5287,13 @@ class ClaudeAccountSwitcher:
         # here: users can't act on them (recovery is always /login + cswap
         # add), and with no GC a one-time event would nag forever. They stay
         # in the JSON payload and logs for diagnostics.
+        mismatch_warning = self._active_mismatch_warning(accounts_info)
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        if dup_warnings or lockstep_warnings:
+        if mismatch_warning or dup_warnings or lockstep_warnings:
             print()
+            if mismatch_warning:
+                warning(mismatch_warning)
             for msg in dup_warnings:
                 warning(msg)
             for msg in lockstep_warnings:

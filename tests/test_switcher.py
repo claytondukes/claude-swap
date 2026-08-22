@@ -7239,6 +7239,152 @@ class TestDuplicateAccountDetection:
         assert switcher._duplicate_account_warnings(info) == []
 
 
+class TestActiveSlotCrossCheck:
+    """`_build_accounts_info` must not trust ~/.claude.json's identity alone.
+
+    Every running Claude Code session periodically rewrites that file with
+    its own cached identity, so after a switch a still-running session for
+    the old account flips `oauthAccount` back while the live store already
+    holds the new account's token. The live credential's lineage is the
+    ground truth: when it matches exactly one slot's stored backup, that
+    slot is active regardless of the config — otherwise `list` marks the
+    wrong row active and reports a phantom duplicate-credential collision.
+    """
+
+    def _creds(self, rt: str) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": f"sk-{rt}", "refreshToken": rt,
+        }})
+
+    def _switcher(self, temp_home, sample_sequence_data, config_email, backups, live):
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": config_email, "accountUuid": "u"},
+        }))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        patches = [
+            patch.object(
+                switcher, "_read_active_credentials",
+                return_value=ActiveCredentials(live, False, False),
+            ),
+            patch.object(
+                switcher, "_read_account_credentials",
+                side_effect=lambda num, email: backups.get(str(num), ""),
+            ),
+        ]
+        return switcher, patches
+
+    def test_stale_config_identity_loses_to_live_lineage(
+        self, temp_home, sample_sequence_data,
+    ):
+        """Config names slot 1, live bytes are slot 2's lineage → slot 2 active."""
+        live = self._creds("rt-2")
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=live,
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        active = {num: is_active for num, _, _, _, is_active, _, _ in info}
+        assert active == {1: False, 2: True}
+        # The active row still serves the LIVE bytes, not its backup copy.
+        assert info[1][5] == live
+        note = switcher._active_mismatch()
+        assert note == {
+            "configEmail": "account1@example.com",
+            "configSlot": "1",
+            "activeSlot": "2",
+        }
+        # The phantom collision is gone: slot 1 reads its own distinct backup.
+        assert switcher._duplicate_account_warnings(info) == []
+        msg = switcher._active_mismatch_warning(info)
+        assert "Account-2" in msg and "account1@example.com" in msg
+
+    def test_agreeing_config_records_no_mismatch(
+        self, temp_home, sample_sequence_data,
+    ):
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-1"),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [True, False]
+        assert switcher._active_mismatch() is None
+        assert switcher._active_mismatch_warning(info) is None
+
+    def test_rotation_ahead_of_every_backup_keeps_config_answer(
+        self, temp_home, sample_sequence_data,
+    ):
+        """Live lineage matching no backup is not evidence — no override."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-1-rotated"),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [True, False]
+        assert switcher._active_mismatch() is None
+
+    def test_multi_slot_match_keeps_config_answer_and_dup_warning(
+        self, temp_home, sample_sequence_data,
+    ):
+        """A genuine duplicate is ambiguous — no override, collision still flagged."""
+        same = self._creds("rt-shared")
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": same, "2": same},
+            live=same,
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [True, False]
+        assert switcher._active_mismatch() is None
+        assert len(switcher._duplicate_account_warnings(info)) == 1
+
+    def test_unmanaged_config_identity_still_resolves_by_lineage(
+        self, temp_home, sample_sequence_data,
+    ):
+        """Config names an identity cswap doesn't manage; live bytes are slot 2's."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "someone-else@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [False, True]
+        note = switcher._active_mismatch()
+        assert note["configSlot"] is None
+        assert note["activeSlot"] == "2"
+
+    def test_mismatch_note_reaches_json_payload(
+        self, temp_home, sample_sequence_data,
+    ):
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+            entries = {
+                str(num): UsageEntry() for num, *_ in info
+            }
+            payload = switcher._build_list_payload(info, entries)
+        assert payload["activeAccountNumber"] == 2
+        assert payload["activeSlotMismatch"] == {
+            "configEmail": "account1@example.com",
+            "configSlot": "1",
+            "activeSlot": "2",
+        }
+        assert "duplicateAccountWarnings" not in payload
+
+
 class TestLockstepUsageDetection:
     """Heuristic detector for the different-generation collapse (issue #117):
     fingerprints and sequence identities look distinct, but both slots report
