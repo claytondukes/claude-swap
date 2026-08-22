@@ -33,7 +33,10 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
 )
-from claude_swap.credentials import ActiveCredentials
+from claude_swap.credentials import (
+    CLAUDE_CODE_KEYCHAIN_SERVICE,
+    ActiveCredentials,
+)
 from claude_swap.usage_store import FetchRecord
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -49,6 +52,110 @@ def macos_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
     switcher = ClaudeAccountSwitcher()
     switcher.platform = Platform.MACOS
     return switcher
+
+
+class TestActiveWriteCoversResolvedServices:
+    """The active-credential write must update every item the read resolves.
+
+    Claude hashes an exported ``CLAUDE_CONFIG_DIR`` into its keychain service
+    name, so a user with a global export (even one that resolves to the
+    default profile through a symlink) reads the *suffixed* item. The historic
+    write path updated only the unsuffixed one: a switch backed up the
+    outgoing credential correctly (read path, suffixed-first) and then
+    activated the target into an item that environment's Claude never reads —
+    every new session silently stayed on the old account and rewrote
+    ``oauthAccount`` back, re-creating the config/live split-brain.
+    """
+
+    OAUTH = '{"claudeAiOauth": {"accessToken": "sk-a", "refreshToken": "rt-a"}}'
+
+    def _written_services(self, macos_switcher, monkeypatch):
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+        calls: list[str] = []
+        monkeypatch.setattr(
+            _kc, "set_password", lambda service, account, value: calls.append(service)
+        )
+        store._write_oauth_credentials(self.OAUTH)
+        return calls
+
+    def test_env_unset_writes_only_the_unsuffixed_item(
+        self, macos_switcher, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        assert self._written_services(macos_switcher, monkeypatch) == [
+            CLAUDE_CODE_KEYCHAIN_SERVICE
+        ]
+
+    def test_config_dir_naming_default_profile_writes_both_items(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        from claude_swap.session import keychain_service_name
+
+        exported = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        assert self._written_services(macos_switcher, monkeypatch) == [
+            keychain_service_name(exported),
+            CLAUDE_CODE_KEYCHAIN_SERVICE,
+        ]
+
+    def test_foreign_config_dir_writes_only_its_hashed_item(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        from claude_swap.session import keychain_service_name
+
+        exported = str(temp_home / "work-profile")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        assert self._written_services(macos_switcher, monkeypatch) == [
+            keychain_service_name(exported)
+        ]
+
+    def test_delete_sweeps_every_resolved_service(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.session import keychain_service_name
+
+        exported = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            _kc, "delete_password", lambda service, account: deleted.append(service)
+        )
+        assert macos_switcher._store._delete_active_keychain_entry() is True
+        assert deleted == [
+            keychain_service_name(exported),
+            CLAUDE_CODE_KEYCHAIN_SERVICE,
+        ]
+
+    def test_partial_write_failure_falls_back_to_the_file(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        """Second-service failure must not leave a half-updated keychain as
+        the recorded backend: the file fallback (whose delete sweep clears
+        every resolved item) takes over, exactly like a first-service failure.
+        """
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.session import keychain_service_name
+
+        exported = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        suffixed = keychain_service_name(exported)
+
+        def set_password(service, account, value):
+            if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                raise _kc.KeychainError("locked")
+
+        monkeypatch.setattr(_kc, "set_password", set_password)
+        monkeypatch.setattr(_kc, "delete_password", lambda service, account: None)
+        store._write_oauth_credentials(self.OAUTH)
+        assert store._last_active_credentials_backend == "file"
+        assert suffixed  # the suffixed write succeeded, then was superseded
 
 
 class TestBackupCredentialsSecurity:

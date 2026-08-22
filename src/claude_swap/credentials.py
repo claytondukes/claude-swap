@@ -107,6 +107,30 @@ def _active_oauth_keychain_services() -> list[str]:
     return services
 
 
+def _active_oauth_keychain_write_services() -> list[str]:
+    """Keychain services an active-credential WRITE (or delete) must cover.
+
+    The same resolution as :func:`_active_oauth_keychain_services`, and for the
+    same reason in mirror image: whatever items the active environment's Claude
+    may READ must all see the new credential, or a switch performed here is
+    invisible somewhere else. The failure this closes: with a global
+    ``CLAUDE_CONFIG_DIR`` export naming the default profile, Claude reads the
+    *suffixed* item while the historic write path updated only the unsuffixed
+    one — the switch backed up the outgoing credential correctly (read path,
+    suffixed-first) and then activated the target into an item the user's
+    Claude never reads, so every new session silently stayed on the old
+    account and rewrote ``oauthAccount`` back, re-creating the split-brain.
+
+    In the default-profile-alias case both names are one logical store seen
+    from different environments (shells with the export vs launchd agents and
+    GUI-launched apps without it), so both are written and the two can never
+    drift. This deliberately updates/creates Claude's hashed entry for the
+    ACTIVE environment only — the session-module rule against seeding hashed
+    entries for *other* profiles cswap isn't running in still stands.
+    """
+    return _active_oauth_keychain_services()
+
+
 # Service name for per-account backup credentials now managed via the ``security``
 # CLI on macOS. Deliberately distinct from KEYRING_SERVICE so old keyring items and
 # new security items coexist during migration (safe write → verify → delete).
@@ -783,16 +807,23 @@ class CredentialStore:
         returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
         a return is proof — which is the fact ``_pin_file_mode`` needs and used
         to discard. Off macOS there is no Keychain item, hence ``True``.
+
+        Sweeps every service the active environment resolves (see
+        ``_active_oauth_keychain_write_services``): Claude reads its hashed
+        per-``CLAUDE_CONFIG_DIR`` item before the plaintext file too, so a
+        stale suffixed entry shadows the file exactly like the unsuffixed one.
         """
         if self._host.platform != Platform.MACOS:
             return True
-        try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
-        except Exception:
-            return False  # best-effort; a down Keychain can't be cleaned now
-        return True
+        cleared = True
+        for service in _active_oauth_keychain_write_services():
+            try:
+                macos_keychain.delete_password(
+                    service, macos_keychain.keychain_account_name()
+                )
+            except Exception:
+                cleared = False  # best-effort; a down Keychain can't be cleaned now
+        return cleared
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
@@ -973,12 +1004,17 @@ class CredentialStore:
         """
         if self._use_keychain():
             try:
-                self._kc_call(
-                    macos_keychain.set_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
-                    macos_keychain.keychain_account_name(),
-                    credentials,
-                )
+                # Every service the active environment's read path resolves —
+                # a partial write (some services updated, one failed) drops to
+                # the file path below, whose delete sweep clears them all, so
+                # the stores can't be left telling two different stories.
+                for service in _active_oauth_keychain_write_services():
+                    self._kc_call(
+                        macos_keychain.set_password,
+                        service,
+                        macos_keychain.keychain_account_name(),
+                        credentials,
+                    )
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)
