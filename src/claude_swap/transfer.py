@@ -289,13 +289,23 @@ def export_accounts(
             "credentials/config. Re-add with: cswap --add-account --slot <number>"
         )
 
-    # Only carry activeAccountNumber if that slot is actually present in the
-    # payload — otherwise import would reference an account that isn't there
-    # (e.g., the recorded active slot was skipped due to missing backup).
-    recorded_active = sequence_data.get("activeAccountNumber")
+    # The envelope's active slot must agree with how the rows were labeled:
+    # the lineage-resolved live slot wins when one resolved, since the
+    # recorded roster marker can lag a switch or a split-brain correction —
+    # rows would put the live credential under Account-B while the envelope
+    # advertised Account-A, and a clean-destination import would then seed
+    # the wrong account. The recorded marker is only trusted when no live
+    # slot resolved at all. Either way it is carried only if that slot is
+    # actually present in the payload — otherwise import would reference an
+    # account that isn't there (e.g., skipped due to missing backup).
+    preferred_active = (
+        int(active_num)
+        if active_num is not None
+        else sequence_data.get("activeAccountNumber")
+    )
     exported_nums = {a["number"] for a in accounts_payload}
     active_in_payload = (
-        recorded_active if recorded_active in exported_nums else None
+        preferred_active if preferred_active in exported_nums else None
     )
 
     envelope = {

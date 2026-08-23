@@ -2058,9 +2058,12 @@ class TestExportActiveSlotByLineage:
 
         out = temp_home / "all.cswap"
         export_accounts(s, str(out))
-        rows = {
-            r["number"]: r for r in json.loads(out.read_text())["accounts"]
-        }
+        envelope = json.loads(out.read_text())
+        rows = {r["number"]: r for r in envelope["accounts"]}
+
+        # The envelope agrees with the rows: the lineage-resolved slot, not
+        # the recorded roster marker the stale config left behind.
+        assert envelope["activeAccountNumber"] == 2
 
         # Alice's row: her own backup — NOT the live (bob's) bytes the old
         # config-identity compare exported under her name.
