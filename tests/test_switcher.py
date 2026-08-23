@@ -7402,7 +7402,10 @@ class TestSelfSwitchProvenance:
             for p in patches:
                 p.stop()
         msg = str(exc.value)
-        assert "Account-2" in msg and "cswap add --slot 2" in msg
+        assert "Account-2" in msg and "cswap switch 2" in msg
+        # The message names the RESOLVED config path and the config identity.
+        assert str(switcher._get_claude_config_path()) in msg
+        assert "test@example.com" in msg
 
     def test_add_still_accepts_a_fresh_login_capture(
         self, temp_home, mock_claude_config, sample_sequence_data,

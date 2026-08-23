@@ -3085,51 +3085,54 @@ class ClaudeAccountSwitcher:
             )
 
     def _reject_foreign_lineage_capture(
-        self,
-        target_slot: str | int | None,
-        creds: str,
-        exclude: str | None = None,
+        self, config_identity: tuple[str, str], creds: str
     ) -> None:
-        """Refuse a capture whose lineage provably belongs to another slot.
+        """Refuse a capture whose lineage belongs to a different identity.
 
-        ``add_account`` snapshots the live credential under the CONFIG
-        identity's slot. During a config/live split-brain the config still
-        names the previous account while the live store holds another
-        managed slot's token — capturing then files account B's token under
-        account A's identity, the exact backup poisoning the lineage
-        machinery exists to prevent, triggered by the one command users run
-        to repair their roster. Local, COMPLETE evidence only: a readable
-        fingerprint match against a different slot's stored backup. Anything
-        less (unreadable backups, no match — e.g. the normal fresh-login
-        capture, whose lineage is new) keeps the capture permissive exactly
-        as before. Fail-loud fits an interactive add: the remedy is a real
-        login, not a silent mislabel.
+        ``add_account`` files the live credential under the CONFIG identity.
+        During a config/live split-brain the config still names the previous
+        account while the live store holds another managed account's token —
+        capturing then files account B's token under account A's identity,
+        the exact backup poisoning the lineage machinery exists to prevent,
+        triggered by the one command users run to repair their roster.
 
-        ``exclude``: a slot whose lineage match is legitimate — the
-        migrate-from slot when the same account is moving slots, whose old
-        backup naturally shares the captured lineage.
+        The comparison is identity-vs-identity, not slot-vs-slot: a readable,
+        COMPLETE fingerprint match against any slot's stored backup names the
+        lineage's owner, and the capture is refused only when that owner's
+        registry identity differs from the config identity being filed. That
+        keeps every legitimate flow permissive with no slot exemptions — a
+        same-account refresh or slot migration matches a slot with the SAME
+        identity; a fresh login mints a lineage matching nothing — while a
+        cross-identity match is refused regardless of which slot the user
+        aimed at (an earlier target-slot exemption let the guard's own
+        remediation bypass it). Fail-loud fits an interactive add: the remedy
+        is a real login, not a silent mislabel.
         """
         fp = oauth.credential_fingerprint(creds)
         if not fp:
             return
+        current_email, current_org = config_identity
         data = self._get_sequence_data() or {}
         for num, acct in data.get("accounts", {}).items():
-            if target_slot is not None and num == str(target_slot):
-                continue
-            if exclude is not None and num == str(exclude):
-                continue
             other, complete = self._read_backup_evidence(
                 num, acct.get("email", "")
             )
-            if complete and other and oauth.credential_fingerprint(other) == fp:
-                raise ValidationError(
-                    f"The live credential belongs to Account-{num} "
-                    f"({acct.get('email', '')}), not to the login "
-                    "~/.claude.json names — capturing it would file one "
-                    "account's token under another. Log in as the account "
-                    "you want to add and retry, or refresh the owner with: "
-                    f"cswap add --slot {num}"
-                )
+            if not (complete and other):
+                continue
+            if oauth.credential_fingerprint(other) != fp:
+                continue
+            owner_email = acct.get("email", "")
+            owner_org = acct.get("organizationUuid", "") or ""
+            if (owner_email, owner_org) == (current_email, current_org or ""):
+                continue
+            raise ValidationError(
+                f"The live credential belongs to Account-{num} "
+                f"({owner_email}), while {self._get_claude_config_path()} "
+                f"names {current_email} — capturing it would file one "
+                "account's token under another. Log in as the account you "
+                "want to capture and retry, or activate the owner first: "
+                f"cswap switch {num}"
+            )
 
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
@@ -3355,7 +3358,9 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
-            self._reject_foreign_lineage_capture(account_num, current_creds)
+            self._reject_foreign_lineage_capture(
+                (current_email, current_org_uuid), current_creds
+            )
 
             config_path = self._get_claude_config_path()
             try:
@@ -3466,7 +3471,7 @@ class ClaudeAccountSwitcher:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
         self._reject_foreign_lineage_capture(
-            account_num, current_creds, exclude=migrate_from
+            (current_email, current_org_uuid), current_creds
         )
 
         config_path = self._get_claude_config_path()
@@ -6337,8 +6342,13 @@ class ClaudeAccountSwitcher:
             return True
         if not live:
             return True
-        backup = self._read_account_credentials(slot, email)
-        if not backup:
+        backup, complete = self._read_backup_evidence(slot, email)
+        if not backup or not complete:
+            # No backup, or a value served around a failed authoritative
+            # read: a stale Keychain fallback byte-equal to the live
+            # predecessor would certify an "already-active" no-op while the
+            # unreadable .enc may hold a newer generation — force the full
+            # switch so the reconciliation machinery decides instead.
             return False
         return live == backup or (
             oauth.credential_fingerprint(live)
@@ -7125,6 +7135,18 @@ class ClaudeAccountSwitcher:
                     current_account, current_email, original_creds,
                     provenance, data,
                 )
+                if foreign_slot and kind in ("foreign", "foreign-synced"):
+                    # The live bytes provably belong to another slot: name
+                    # the TRUE outgoing account in the result refs. Write
+                    # targeting is untouched — the classifier already routed
+                    # the bytes safely; only the report was repeating the
+                    # config's stale story (from==to, "switched: false" on a
+                    # switch that really moved the live identity).
+                    owner_email = (
+                        data.get("accounts", {}).get(foreign_slot, {})
+                        .get("email", "")
+                    )
+                    from_ref = account_ref(int(foreign_slot), owner_email)
                 if kind in ("foreign", "alien", "known-foreign"):
                     # Positively not this slot's bytes: never into a slot;
                     # never silently destroyed. The safety copy (which raises
