@@ -539,9 +539,13 @@ class SessionManager:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
-            # refresh token.
-            current = self.switcher._get_current_account()
-            if current is not None and current == (email, org_uuid):
+            # refresh token. Lineage-corrected (current_account_number, the
+            # same verdict list/status/autoswitch use), NOT the raw config
+            # identity: oauthAccount alone can still name the PREVIOUS
+            # account while the live store already holds another's token,
+            # and "launching directly" then runs the wrong account under
+            # this account's name.
+            if self.switcher.current_account_number() == str(account_num):
                 print(
                     dimmed(
                         f"Account-{account_num} ({email}) is already the active "

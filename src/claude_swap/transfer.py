@@ -201,8 +201,16 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
+    # Identify the live active account (live vault has fresher tokens than
+    # backup). Lineage-corrected verdict, not the raw config identity: with
+    # config naming A while the live store holds B's token, the identity
+    # compare exported B's live bytes labeled as A. The CONFIG source is
+    # gated separately on the config identity actually matching the row —
+    # during that same split-brain the live config's oauthAccount still
+    # names A, and exporting it under B's row would restore the wrong
+    # identity on import; B's stored backup config is the right one.
+    active_num = switcher.current_account_number()
+    config_identity = switcher._get_current_account()
 
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
@@ -210,11 +218,7 @@ def export_accounts(
         email = record.get("email", "")
         org_uuid = record.get("organizationUuid", "") or ""
 
-        is_active = (
-            current_identity is not None
-            and current_identity[0] == email
-            and current_identity[1] == org_uuid
-        )
+        is_active = num == active_num
 
         if is_active:
             creds_text = switcher._read_credentials()
@@ -222,28 +226,32 @@ def export_accounts(
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"
                 )
+        else:
+            creds_text = switcher._read_account_credentials(num, email)
+
+        if is_active and config_identity == (email, org_uuid):
             config_path = switcher._get_claude_config_path()
             if not config_path.exists():
                 raise ConfigError("Claude config file not found")
             config_text = config_path.read_text(encoding="utf-8")
         else:
-            creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
-            if not creds_text or not config_text:
-                if explicit_account:
-                    if not creds_text:
-                        raise CredentialReadError(
-                            f"no backup credentials found for account {num} ({email})"
-                        )
-                    raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
+
+        if not creds_text or not config_text:
+            if explicit_account:
+                if not creds_text:
+                    raise CredentialReadError(
+                        f"no backup credentials found for account {num} ({email})"
                     )
-                _eprint(
-                    f"Skipping Account-{num} ({email}): no stored "
-                    f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
+                raise ConfigError(
+                    f"no backup config found for account {num} ({email})"
                 )
-                continue
+            _eprint(
+                f"Skipping Account-{num} ({email}): no stored "
+                f"credentials/config — re-add with: "
+                f"cswap --add-account --slot {num}"
+            )
+            continue
 
         config_obj = _parse_payload(config_text, f"config for {email}")
         if not full:
@@ -635,11 +643,13 @@ def import_accounts(
     # live login, a plain switch would back the (possibly stale) live
     # credentials up over it (issue #79) — point at the explicit activation
     # path instead.
-    identity = switcher._get_current_account()
-    if identity is not None and final is not None:
-        live_slot = switcher._find_account_slot(final, identity[0], identity[1])
+    if final is not None:
+        live_slot = switcher.current_account_number()
         if live_slot is not None and live_slot in written_slots:
+            live_email = (
+                final.get("accounts", {}).get(live_slot, {}).get("email", "")
+            )
             _eprint(
-                f"Note: {identity[0]} is your current live login — activate the "
+                f"Note: {live_email} is your current live login — activate the "
                 f"imported credentials with: cswap --switch-to {live_slot} --force"
             )
