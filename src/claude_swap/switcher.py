@@ -3084,6 +3084,53 @@ class ClaudeAccountSwitcher:
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
 
+    def _reject_foreign_lineage_capture(
+        self,
+        target_slot: str | int | None,
+        creds: str,
+        exclude: str | None = None,
+    ) -> None:
+        """Refuse a capture whose lineage provably belongs to another slot.
+
+        ``add_account`` snapshots the live credential under the CONFIG
+        identity's slot. During a config/live split-brain the config still
+        names the previous account while the live store holds another
+        managed slot's token — capturing then files account B's token under
+        account A's identity, the exact backup poisoning the lineage
+        machinery exists to prevent, triggered by the one command users run
+        to repair their roster. Local, COMPLETE evidence only: a readable
+        fingerprint match against a different slot's stored backup. Anything
+        less (unreadable backups, no match — e.g. the normal fresh-login
+        capture, whose lineage is new) keeps the capture permissive exactly
+        as before. Fail-loud fits an interactive add: the remedy is a real
+        login, not a silent mislabel.
+
+        ``exclude``: a slot whose lineage match is legitimate — the
+        migrate-from slot when the same account is moving slots, whose old
+        backup naturally shares the captured lineage.
+        """
+        fp = oauth.credential_fingerprint(creds)
+        if not fp:
+            return
+        data = self._get_sequence_data() or {}
+        for num, acct in data.get("accounts", {}).items():
+            if target_slot is not None and num == str(target_slot):
+                continue
+            if exclude is not None and num == str(exclude):
+                continue
+            other, complete = self._read_backup_evidence(
+                num, acct.get("email", "")
+            )
+            if complete and other and oauth.credential_fingerprint(other) == fp:
+                raise ValidationError(
+                    f"The live credential belongs to Account-{num} "
+                    f"({acct.get('email', '')}), not to the login "
+                    "~/.claude.json names — capturing it would file one "
+                    "account's token under another. Log in as the account "
+                    "you want to add and retry, or refresh the owner with: "
+                    f"cswap add --slot {num}"
+                )
+
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
@@ -3308,6 +3355,7 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            self._reject_foreign_lineage_capture(account_num, current_creds)
 
             config_path = self._get_claude_config_path()
             try:
@@ -3417,6 +3465,9 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        self._reject_foreign_lineage_capture(
+            account_num, current_creds, exclude=migrate_from
+        )
 
         config_path = self._get_claude_config_path()
         try:

@@ -7382,6 +7382,49 @@ class TestSelfSwitchProvenance:
             "credential, so the anchor never left the recorded marker"
         )
 
+    def test_add_refuses_a_split_brain_capture(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """`cswap add` during config=A/live=B files B's token under A — the
+        capture must refuse when the live lineage provably belongs to
+        another managed slot, pointing at the real remedy."""
+        switcher, live_state, _slot1_backup, patches = (
+            self._split_brain_switcher(temp_home, sample_sequence_data)
+        )
+        try:
+            with patch.object(
+                switcher, "_read_capture_credentials",
+                return_value=live_state["creds"],
+            ):
+                with pytest.raises(ValidationError) as exc:
+                    switcher.add_account()
+        finally:
+            for p in patches:
+                p.stop()
+        msg = str(exc.value)
+        assert "Account-2" in msg and "cswap add --slot 2" in msg
+
+    def test_add_still_accepts_a_fresh_login_capture(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The documented repair (log in, then re-add): a fresh login mints a
+        NEW lineage matching no stored backup — the guard must stay quiet."""
+        switcher, live_state, _slot1_backup, patches = (
+            self._split_brain_switcher(temp_home, sample_sequence_data)
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-fresh", "refreshToken": "rt-fresh",
+            "expiresAt": 9999999999000}})
+        live_state["creds"] = fresh
+        try:
+            with patch.object(
+                switcher, "_read_capture_credentials", return_value=fresh,
+            ):
+                switcher.add_account()  # refresh-in-place for account 1
+        finally:
+            for p in patches:
+                p.stop()
+
     def test_switch_to_the_config_slot_heals_the_split_brain_offline(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
