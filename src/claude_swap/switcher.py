@@ -5784,12 +5784,19 @@ class ClaudeAccountSwitcher:
         # Ensure org fields are migrated before checking composite key
         self._get_sequence_data_migrated()
 
+        # Lineage verdict first: it answers for BOTH the split-brain (stale
+        # oauthAccount naming the previous account) and the cleared-config
+        # state (no oauthAccount at all), where a live credential still
+        # uniquely names its slot. Only when NEITHER the config nor the
+        # lineage can name a live slot is this genuinely a fresh machine.
+        current_num = self.current_account_number()
+
         # Fresh-machine path: no live Claude session, but we have managed accounts
         # (e.g. right after cswap --import). Activate the recorded
         # activeAccountNumber, or fall back to the first slot in sequence.
         # With no live state to capture, the target must have valid backups —
         # walk the sequence if the preferred target is broken.
-        if identity is None:
+        if identity is None and current_num is None:
             data = self._get_sequence_data() or {}
             sequence = data.get("sequence", [])
             preferred = data.get("activeAccountNumber")
@@ -5839,16 +5846,15 @@ class ClaudeAccountSwitcher:
                 if json_output else None
             )
 
-        current_email, current_org_uuid = identity
-
         # Managed-check by the lineage-corrected verdict, not the config
         # identity alone: a stale oauthAccount would otherwise route a
         # split-brain into the interactive auto-add below, which captures the
         # LIVE account's token under the stale identity's email — a
-        # mislabeled slot. current_account_number() returns the slot whose
-        # credential is actually live (None only for a genuinely unmanaged
-        # login, whose lineage matches no backup).
-        current_num = self.current_account_number()
+        # mislabeled slot. current_num is None here only for a genuinely
+        # unmanaged login (lineage matches no backup), in which case the
+        # config identity exists (the both-None case took the fresh-machine
+        # branch above).
+        current_email = identity[0] if identity else ""
         if current_num is None:
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
@@ -5993,11 +5999,14 @@ class ClaudeAccountSwitcher:
         # live state into a fresh backup before swapping, so the active
         # slot's stored backup may be stale or absent without blocking us.
         #
-        # Usage-aware rotation anchors on the live account (current_num) so it
-        # never lands a no-op on the slot you're already on when the live login
-        # has drifted from the recorded activeAccountNumber. Plain rotation keeps
-        # anchoring on active_account for byte-for-byte unchanged behavior.
-        anchor = current_num if strategy == "next-available" else active_account
+        # Every rotation anchors on the live account (current_num, the
+        # lineage verdict) so it never lands a no-op self-switch on the slot
+        # you're already on when the recorded activeAccountNumber lags the
+        # live login — plain rotation used to keep the recorded marker (its
+        # pre-verdict behavior) and silently failed to rotate in exactly
+        # that state. The marker remains the fallback when no live slot
+        # resolved.
+        anchor = current_num or active_account
         try:
             current_index = sequence.index(int(anchor))
         except (TypeError, ValueError):
@@ -6428,11 +6437,21 @@ class ClaudeAccountSwitcher:
             current_account, current_email
         )
         if backup and backup == original_creds:
+            # Byte identity needs no evidence grade: own-bytes writes no
+            # credential, so even a stale fallback copy cannot mislead a
+            # write here.
             return ("own-bytes", None)
-        if backup and (
+        if backup and backup_complete and (
             oauth.credential_fingerprint(backup)
             == oauth.credential_fingerprint(original_creds)
         ):
+            # own-family DOES write the live bytes into this slot, so the
+            # matching backup must be complete evidence: a stale Keychain
+            # fallback served around an unreadable .enc could carry another
+            # slot's lineage, and short-circuiting here would skip the
+            # cross-slot sweep that catches exactly that. With incomplete
+            # evidence, fall through — the sweep/oracle machinery decides,
+            # and a no-owner result still lands on the same pre-fix backup.
             return ("own-family", None)
         live_oauth = oauth.extract_oauth_data(original_creds)
         if live_oauth is not None and not (

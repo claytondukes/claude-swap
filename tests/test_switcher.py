@@ -7295,6 +7295,82 @@ class TestSelfSwitchProvenance:
         warnings = (result or {}).get("warnings", [])
         assert any("already matches Account-2" in w for w in warnings), warnings
 
+    def _split_brain_switcher(self, temp_home, sample_sequence_data):
+        """config + marker say slot 1, live bytes are slot 2's backup."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        slot1_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+            "expiresAt": 9999999999000}})
+        slot2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000}})
+        creds_store[("1", "test@example.com")] = slot1_backup
+        creds_store[("2", "account2@example.com")] = slot2_backup
+        configs_store[("1", "test@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com",
+                             "accountUuid": "uuid-1"}})
+        configs_store[("2", "account2@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "account2@example.com",
+                             "accountUuid": "uuid-2"}})
+        live_state = {"creds": slot2_backup}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        p = patch.object(
+            switcher, "_read_active_credentials",
+            side_effect=lambda: ActiveCredentials(
+                live_state.get("creds", ""), False, False
+            ),
+        )
+        p.start()
+        patches.append(p)
+        return switcher, live_state, slot1_backup, patches
+
+    def test_plain_rotation_anchors_on_the_lineage_verdict(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Split-brain (config + recorded marker say slot 1, live bytes are
+        slot 2's): plain rotation must rotate off the LIVE slot. Anchored on
+        the recorded marker, it selected slot 2 — the slot already live —
+        and silently failed to rotate."""
+        switcher, live_state, slot1_backup, patches = (
+            self._split_brain_switcher(temp_home, sample_sequence_data)
+        )
+        try:
+            with patch("claude_swap.oauth.fetch_oauth_profile",
+                       return_value=None), \
+                 patch.object(switcher, "list_accounts"):
+                switcher.switch(json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert live_state["creds"] == slot1_backup, (
+            "rotation landed nowhere: the live store still holds slot 2's "
+            "credential, so the anchor never left the recorded marker"
+        )
+
+    def test_rotation_resolves_by_lineage_with_no_config_identity(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A cleared oauthAccount with a live credential that uniquely names
+        slot 2 is NOT a fresh machine: bare switch must rotate to slot 1,
+        not re-activate the recorded marker through the fresh-machine path."""
+        switcher, live_state, slot1_backup, patches = (
+            self._split_brain_switcher(temp_home, sample_sequence_data)
+        )
+        switcher._get_claude_config_path().write_text(json.dumps({}))
+        try:
+            with patch("claude_swap.oauth.fetch_oauth_profile",
+                       return_value=None), \
+                 patch.object(switcher, "list_accounts"):
+                switcher.switch(json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert live_state["creds"] == slot1_backup
+
 
 class TestDuplicateAccountDetection:
     def _switcher(self, temp_home, sample_sequence_data):
@@ -7758,6 +7834,32 @@ class TestActiveSlotCrossCheck:
             "3": ("", True),
         })
         assert (kind, slot) == ("foreign", "2")
+
+    _DUP_OLD = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-dup-old", "refreshToken": "rt-dup",
+    }})
+
+    def test_own_family_requires_complete_evidence(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """own-family writes the live bytes into the slot, so a lineage match
+        against an incomplete current-slot read (stale Keychain fallback
+        around an unreadable .enc) must not short-circuit past the
+        cross-slot sweep — which here finds the readable owner and stashes."""
+        switcher = self._three_slot_switcher(sample_sequence_data)
+        kind, slot = self._classify(switcher, {
+            "1": (self._DUP_OLD, True),   # own-lineage value, incomplete read
+            "2": (self._DUP, False),
+            "3": (self._THIRD, False),
+        })
+        assert (kind, slot) == ("foreign", "2")
+        # The control: complete evidence keeps the own-family fast path.
+        kind, slot = self._classify(switcher, {
+            "1": (self._DUP_OLD, False),
+            "2": (self._DUP, False),
+            "3": (self._THIRD, False),
+        })
+        assert (kind, slot) == ("own-family", None)
 
     def test_switch_local_sweep_no_owner_stays_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
