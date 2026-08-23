@@ -7548,6 +7548,54 @@ class TestActiveSlotCrossCheck:
         with patches[0], patches[1]:
             assert switcher.current_account_number() is None
 
+    def test_status_payload_shares_the_lineage_verdict(
+        self, temp_home, sample_sequence_data,
+    ):
+        """--status reports the corrected slot, files usage under ITS registry
+        identity, and carries the mismatch — not the stale config account."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        collected: list = []
+
+        def collect(info, **kwargs):
+            collected.append(info[0])
+            return {str(info[0][0]): UsageEntry()}
+
+        with patches[0], patches[1], patch.object(
+            switcher, "_collect_usage_entries", side_effect=collect,
+        ):
+            payload = switcher._build_status_payload()
+        assert payload["active"]["number"] == 2
+        assert payload["active"]["email"] == "account2@example.com"
+        assert payload["activeSlotMismatch"] == {
+            "configEmail": "account1@example.com",
+            "configSlot": "1",
+            "activeSlot": "2",
+        }
+        # The usage row was filed under slot 2's registry identity.
+        assert collected[0][0] == 2
+        assert collected[0][1] == "account2@example.com"
+
+    def test_status_human_path_prints_the_corrected_slot(
+        self, temp_home, sample_sequence_data, capsys,
+    ):
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        with patches[0], patches[1], patch.object(
+            switcher, "_collect_usage_entries",
+            side_effect=lambda info, **kw: {str(info[0][0]): UsageEntry()},
+        ):
+            switcher.status()
+        captured = capsys.readouterr()
+        text = captured.out + captured.err
+        assert "Account-2" in text and "account2@example.com" in text
+
     def test_mismatch_note_reaches_json_payload(
         self, temp_home, sample_sequence_data,
     ):

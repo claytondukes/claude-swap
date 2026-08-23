@@ -3918,6 +3918,11 @@ class ClaudeAccountSwitcher:
         email = next(
             (info[1] for info in accounts_info if str(info[0]) == slot), ""
         )
+        return self._active_mismatch_warning_text(note, email)
+
+    def _active_mismatch_warning_text(self, note: dict, email: str) -> str:
+        """Render one active-slot mismatch note (shared by list and status)."""
+        slot = note["activeSlot"]
         config_path = self._get_claude_config_path()
         if note.get("configEmail"):
             lead = (
@@ -5449,12 +5454,24 @@ class ClaudeAccountSwitcher:
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
+    def _resolve_status_slot(
+        self, data: dict, identity: tuple[str, str]
+    ) -> tuple[str | None, dict | None]:
+        """Active slot for the status paths — the same lineage-corrected
+        verdict list and the auto-switch engine use. Deriving it from the
+        config alone reported the stale slot AND filed the live token's usage
+        under that slot's row in the shared usage store."""
+        email, org_uuid = identity
+        config_slot = self._find_account_slot(data, email, org_uuid)
+        live = self._read_active_credentials()
+        return self._resolve_active_slot(data, identity, config_slot, live)
+
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
         identity = self._get_current_account()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
-        current_email, current_org_uuid = identity
+        current_email, _current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
@@ -5463,7 +5480,7 @@ class ClaudeAccountSwitcher:
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num, mismatch = self._resolve_status_slot(data, identity)
         if not account_num:
             return {
                 "schemaVersion": SCHEMA_VERSION,
@@ -5471,16 +5488,20 @@ class ClaudeAccountSwitcher:
             }
 
         acct = data["accounts"][account_num]
+        # The SLOT's registry identity, not the config's: on a corrected
+        # split-brain the config email belongs to the other account, and the
+        # usage entry must be filed under the account whose token is live.
+        active_email = acct.get("email", current_email)
         org_name = acct.get("organizationName", "") or ""
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
-        entry = self._active_account_usage(account_num, current_email, org_uuid)
+        entry = self._active_account_usage(account_num, active_email, org_uuid)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
-            "email": current_email,
+            "email": active_email,
             "organizationName": org_name,
             "organizationUuid": org_uuid,
             "isOrganization": bool(org_uuid),
@@ -5498,11 +5519,14 @@ class ClaudeAccountSwitcher:
                     entry.last_good, entry.fetched_at, entry.age_s
                 )
             )
-        return {
+        payload = {
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
             "totalManagedAccounts": len(data.get("accounts", {})),
         }
+        if mismatch:
+            payload["activeSlotMismatch"] = dict(mismatch)
+        return payload
 
     def status(self, json_output: bool = False) -> dict | None:
         """Display current account status (or return the schema-v1 payload)."""
@@ -5513,31 +5537,37 @@ class ClaudeAccountSwitcher:
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return None
-        current_email, current_org_uuid = identity
+        current_email, _current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
-        org_name = ""
-        if account_num is not None:
-            org_name = data["accounts"][account_num].get("organizationName", "") or ""
+        account_num, mismatch = self._resolve_status_slot(data, identity)
 
         if account_num:
-            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
+            acct = data["accounts"][account_num]
+            # The slot's registry identity, not the config's — see
+            # _build_status_payload.
+            active_email = acct.get("email", current_email)
+            org_name = acct.get("organizationName", "") or ""
+            org_uuid = acct.get("organizationUuid", "") or ""
+            tag = self._get_display_tag(active_email, org_name, org_uuid)
             total = len(data.get("accounts", {}))
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email} {muted(f'[{tag}]')})"
+                f"({active_email} {muted(f'[{tag}]')})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
-                account_num, current_email, current_org_uuid
+                account_num, active_email, org_uuid
             )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")
+            if mismatch:
+                print()
+                warning(self._active_mismatch_warning_text(mismatch, active_email))
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
