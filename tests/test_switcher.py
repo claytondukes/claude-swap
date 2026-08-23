@@ -2363,6 +2363,37 @@ class TestActiveAccountRefresh:
             call("1", "test@example.com", self._REFRESHED),
         ]
 
+    def test_expired_recovery_proceeds_during_config_split_brain(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Config names another account but the under-lock live bytes are
+        byte-equal to the caller's snapshot: nothing landed in the gap — the
+        mismatch is the split-brain, and deferring on it reported the
+        corrected slot TOKEN_EXPIRED forever instead of refreshing it."""
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "other@example.com",
+                             "accountUuid": "uuid-other"},
+        }))
+        switcher = self._switcher(sample_sequence_data)
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 return_value=self._EXPIRED,
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._EXPIRED
+            )
+        assert result.usage == {"five_hour": {"pct": 3}}
+        write_live.assert_called()
+
     def test_resync_proceeds_when_config_identity_is_stale(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -7350,6 +7381,26 @@ class TestSelfSwitchProvenance:
             "rotation landed nowhere: the live store still holds slot 2's "
             "credential, so the anchor never left the recorded marker"
         )
+
+    def test_switch_to_the_config_slot_heals_the_split_brain_offline(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """`cswap switch-to 1` with config=1, live bytes = slot 2's, oracle
+        down: local lineage evidence classifies the divergence as the
+        split-brain and the self-switch reconciles — conceding noop-diverged
+        left the very command that fixes a split-brain doing nothing."""
+        switcher, live_state, slot1_backup, patches = (
+            self._split_brain_switcher(temp_home, sample_sequence_data)
+        )
+        try:
+            with patch("claude_swap.oauth.fetch_oauth_profile",
+                       return_value=None), \
+                 patch.object(switcher, "list_accounts"):
+                switcher.switch_to("1", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert live_state["creds"] == slot1_backup
 
     def test_rotation_resolves_by_lineage_with_no_config_identity(
         self, temp_home, mock_claude_config, sample_sequence_data,

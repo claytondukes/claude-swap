@@ -131,6 +131,33 @@ class TestActiveWriteCoversResolvedServices:
             CLAUDE_CODE_KEYCHAIN_SERVICE,
         ]
 
+    def test_all_priors_read_before_any_write(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        """A prior-read failing after an earlier write would leave the undo
+        racing the same broken Keychain — reads-then-writes aborts with
+        nothing yet written."""
+        from claude_swap import macos_keychain as _kc
+
+        exported = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+        ops: list[str] = []
+        monkeypatch.setattr(
+            _kc, "get_password",
+            lambda service, account: ops.append(f"get:{service}") or None,
+        )
+        monkeypatch.setattr(
+            _kc, "set_password",
+            lambda service, account, value: ops.append(f"set:{service}"),
+        )
+        store._write_oauth_credentials(self.OAUTH)
+        gets = [i for i, op in enumerate(ops) if op.startswith("get:")]
+        sets = [i for i, op in enumerate(ops) if op.startswith("set:")]
+        assert len(gets) == 2 and len(sets) == 2
+        assert max(gets) < min(sets)
+
     def test_partial_write_failure_undoes_the_written_service(
         self, macos_switcher, monkeypatch, temp_home
     ):

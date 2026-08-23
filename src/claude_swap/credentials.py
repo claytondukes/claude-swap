@@ -1014,17 +1014,25 @@ class CredentialStore:
                 # serves the new account while another still serves the old
                 # one, and which account a reader sees depends on its
                 # environment — the exact split this multi-service write
-                # exists to prevent. The file path below also sweeps every
-                # item, but only after ITS write succeeds; consistency must
-                # not depend on that.
-                for service in _active_oauth_keychain_write_services():
-                    prior = self._kc_call(
+                # exists to prevent. ALL priors are read before the FIRST
+                # write: a later prior-read failing after an earlier write
+                # would leave the undo racing the same broken Keychain it
+                # needs, while reads-then-writes aborts with nothing yet
+                # written. The file path below also sweeps every item, but
+                # only after ITS write succeeds; consistency must not depend
+                # on that.
+                services = _active_oauth_keychain_write_services()
+                priors = {
+                    service: self._kc_call(
                         macos_keychain.get_password, service, account
                     )
+                    for service in services
+                }
+                for service in services:
                     self._kc_call(
                         macos_keychain.set_password, service, account, credentials
                     )
-                    written.append((service, prior))
+                    written.append((service, priors[service]))
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)

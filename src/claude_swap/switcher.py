@@ -4211,10 +4211,19 @@ class ClaudeAccountSwitcher:
                 #   in the gap leaves exactly that shape. An empty live WITH
                 #   our identity (CC cleared the credential) still passes —
                 #   that is a recovery case.
+                #   EXCEPTION: an identity mismatch with the live bytes still
+                #   byte-equal to the caller's pre-lock snapshot is the
+                #   config/live SPLIT-BRAIN, not a landed switch — nothing
+                #   moved in the gap; the config simply names the previous
+                #   account (a still-running old session rewrites it). The
+                #   lineage-corrected resolver attributed these exact bytes
+                #   to this slot, and deferring on the stale config starved
+                #   the corrected slot's recovery: an expired token was
+                #   reported TOKEN_EXPIRED forever instead of refreshed.
                 # - lineage (refresh-token fingerprint): decides whether the
                 #   live bytes may be CONSUMED or must be replaced from the
                 #   backup.
-                if not self._live_identity_matches(email, org_uuid):
+                if not self._live_identity_matches(email, org_uuid) and live != creds:
                     return _defer(force_refresh)
                 if (
                     live_oauth
@@ -6296,18 +6305,32 @@ class ClaudeAccountSwitcher:
           resolved: run the full switch so ``_perform_switch`` can classify
           (re-sync a legitimate rotation, or preserve foreign bytes and
           restore the slot's stored credential).
-        - ``("noop-diverged", None)`` — live diverged but cannot be
-          classified (offline / endpoint failure / no profile access). Exact
-          pre-fix behavior: an ordinary already-active no-op, silent to the
-          user — endpoint trouble must never surface on the self-switch path
-          either. Leaving everything untouched is also the safe write:
-          activating the stored backup over an unverified live credential
-          could replace a freshly rotated token with its consumed ancestor.
+        - ``("noop-diverged", None)`` — live diverged and cannot be
+          classified by the oracle OR by local lineage evidence (the bytes
+          match no other slot's backup). Exact pre-fix behavior: an ordinary
+          already-active no-op, silent to the user — endpoint trouble must
+          never surface on the self-switch path either. Leaving everything
+          untouched is also the safe write: activating the stored backup
+          over an unverified live credential could replace a freshly rotated
+          token with its consumed ancestor. (A divergence that DOES match
+          another slot's backup is the split-brain, provable offline, and
+          reconciles even with the oracle silent.)
         """
         if self._live_matches_slot_backup(slot, email):
             return "noop", None
         provenance = self._prefetch_live_identity()
         if provenance.get("resolved") is None:
+            if self._live_lineage_has_foreign_owner(slot, provenance.get("live")):
+                # The divergence is the config/live split-brain, provable
+                # offline: the live bytes' lineage matches another managed
+                # slot's stored backup. The full switch repairs it safely
+                # with no oracle — the outgoing classifier proves ownership
+                # by the same fingerprint evidence, never writes the foreign
+                # bytes into this slot, and activation restores this slot's
+                # own credential. Conceding a no-op here left the user's
+                # explicit `switch-to` — the very command that fixes a
+                # split-brain — doing nothing.
+                return "reconcile", provenance
             self._logger.info(
                 "Live credential diverges from Account-%s's stored backup "
                 "and ownership could not be verified; self-switch left "
@@ -6316,6 +6339,29 @@ class ClaudeAccountSwitcher:
             )
             return "noop-diverged", None
         return "reconcile", provenance
+
+    def _live_lineage_has_foreign_owner(self, slot: str, live: str | None) -> bool:
+        """Whether the live bytes' lineage completely matches another slot's backup.
+
+        The self-switch divergence classifier for a silent oracle: a
+        complete, readable match against a DIFFERENT slot's stored backup
+        means the divergence is the config/live split-brain rather than an
+        unattributable rotation. Only complete evidence counts — a value
+        served around a failed authoritative read proves nothing.
+        """
+        live_fp = oauth.credential_fingerprint(live or "")
+        if not live_fp:
+            return False
+        data = self._get_sequence_data() or {}
+        for num, acct in data.get("accounts", {}).items():
+            if num == slot:
+                continue
+            other, complete = self._read_backup_evidence(
+                num, acct.get("email", "")
+            )
+            if complete and other and oauth.credential_fingerprint(other) == live_fp:
+                return True
+        return False
 
     def _prefetch_live_identity(self) -> dict:
         """Resolve the live credential's owner BEFORE the locks are taken.
