@@ -5439,7 +5439,11 @@ class ClaudeAccountSwitcher:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def _active_account_usage(
-        self, account_num: str, current_email: str, org_uuid: str
+        self,
+        account_num: str,
+        current_email: str,
+        org_uuid: str,
+        active: ActiveCredentials | None = None,
     ) -> UsageEntry:
         """Store-backed usage entry for just the active account.
 
@@ -5447,55 +5451,77 @@ class ClaudeAccountSwitcher:
         (``--status`` touches one slot) and runs it through the shared
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
+
+        ``active``: the ``ActiveCredentials`` the caller resolved the slot
+        with. Passing it keeps slot selection and credential bytes one
+        snapshot — a fresh read here could serve a generation a concurrent
+        switch just wrote, filing its usage under the previously-resolved
+        slot's identity.
         """
-        active = self._read_active_credentials()
+        if active is None:
+            active = self._read_active_credentials()
         creds = active.value or ""
         self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
     def _resolve_status_slot(
-        self, data: dict, identity: tuple[str, str]
-    ) -> tuple[str | None, dict | None]:
+        self, data: dict, identity: tuple[str, str] | None
+    ) -> tuple[str | None, dict | None, ActiveCredentials]:
         """Active slot for the status paths — the same lineage-corrected
         verdict list and the auto-switch engine use. Deriving it from the
         config alone reported the stale slot AND filed the live token's usage
-        under that slot's row in the shared usage store."""
-        email, org_uuid = identity
-        config_slot = self._find_account_slot(data, email, org_uuid)
+        under that slot's row in the shared usage store.
+
+        ``identity`` may be None (``.claude.json`` missing or cleared): a
+        managed live credential can still uniquely name its slot by lineage,
+        exactly as the list path resolves it. The ``ActiveCredentials`` used
+        for the verdict is returned so the caller's usage fetch runs on the
+        SAME snapshot — re-reading the store lets a concurrent switch land
+        between the two reads and file one account's usage under another's
+        row."""
+        config_slot = None
+        if identity is not None:
+            email, org_uuid = identity
+            config_slot = self._find_account_slot(data, email, org_uuid)
         live = self._read_active_credentials()
-        return self._resolve_active_slot(data, identity, config_slot, live)
+        slot, mismatch = self._resolve_active_slot(
+            data, identity, config_slot, live
+        )
+        return slot, mismatch, live
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
         identity = self._get_current_account()
-        if identity is None:
-            return {"schemaVersion": SCHEMA_VERSION, "active": None}
-        current_email, _current_org_uuid = identity
-
         data = self._get_sequence_data_migrated()
         if not data:
+            if identity is None:
+                return {"schemaVersion": SCHEMA_VERSION, "active": None}
             return {
                 "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
+                "active": {"email": identity[0], "managed": False},
             }
 
-        account_num, mismatch = self._resolve_status_slot(data, identity)
+        account_num, mismatch, live = self._resolve_status_slot(data, identity)
         if not account_num:
+            if identity is None:
+                return {"schemaVersion": SCHEMA_VERSION, "active": None}
             return {
                 "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
+                "active": {"email": identity[0], "managed": False},
             }
 
         acct = data["accounts"][account_num]
         # The SLOT's registry identity, not the config's: on a corrected
         # split-brain the config email belongs to the other account, and the
         # usage entry must be filed under the account whose token is live.
-        active_email = acct.get("email", current_email)
+        active_email = acct.get("email", identity[0] if identity else "")
         org_name = acct.get("organizationName", "") or ""
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
-        entry = self._active_account_usage(account_num, active_email, org_uuid)
+        entry = self._active_account_usage(
+            account_num, active_email, org_uuid, active=live
+        )
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
@@ -5534,23 +5560,23 @@ class ClaudeAccountSwitcher:
             return self._build_status_payload()
 
         identity = self._get_current_account()
-        if identity is None:
-            print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
-            return None
-        current_email, _current_org_uuid = identity
-
         data = self._get_sequence_data_migrated()
         if not data:
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+            if identity is None:
+                print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
+            else:
+                print(
+                    f"{bolded('Status:')} {identity[0]} {dimmed('(not managed)')}"
+                )
             return None
 
-        account_num, mismatch = self._resolve_status_slot(data, identity)
+        account_num, mismatch, live = self._resolve_status_slot(data, identity)
 
         if account_num:
             acct = data["accounts"][account_num]
             # The slot's registry identity, not the config's — see
             # _build_status_payload.
-            active_email = acct.get("email", current_email)
+            active_email = acct.get("email", identity[0] if identity else "")
             org_name = acct.get("organizationName", "") or ""
             org_uuid = acct.get("organizationUuid", "") or ""
             tag = self._get_display_tag(active_email, org_name, org_uuid)
@@ -5561,15 +5587,17 @@ class ClaudeAccountSwitcher:
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
-                account_num, active_email, org_uuid
+                account_num, active_email, org_uuid, active=live
             )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")
             if mismatch:
                 print()
                 warning(self._active_mismatch_warning_text(mismatch, active_email))
+        elif identity is None:
+            print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
         else:
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+            print(f"{bolded('Status:')} {identity[0]} {dimmed('(not managed)')}")
         return None
 
     def _first_run_setup(self) -> None:
@@ -6356,14 +6384,21 @@ class ClaudeAccountSwitcher:
             # Local reads only (the switch locks are held; no network).
             live_fp = oauth.credential_fingerprint(original_creds)
             if live_fp:
-                for num, acct in data.get("accounts", {}).items():
-                    if num == current_account:
-                        continue
-                    other = self._read_account_credentials(
+                owners = [
+                    num
+                    for num, acct in data.get("accounts", {}).items()
+                    if num != current_account
+                    and (other := self._read_account_credentials(
                         num, acct.get("email", "")
-                    )
-                    if other and oauth.credential_fingerprint(other) == live_fp:
-                        return ("foreign-synced", num)
+                    ))
+                    and oauth.credential_fingerprint(other) == live_fp
+                ]
+                # Exactly one, same rule as _resolve_active_slot: two slots
+                # sharing the lineage is the genuine-duplicate corruption,
+                # where naming either would be a guess — fall through to the
+                # verdict machinery below instead.
+                if len(owners) == 1:
+                    return ("foreign-synced", owners[0])
             if self._probe_verdicts.get(
                 self._lineage_key(
                     current_account, current_email,

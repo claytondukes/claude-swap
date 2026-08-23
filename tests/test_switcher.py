@@ -7342,9 +7342,11 @@ class TestActiveSlotCrossCheck:
         self, temp_home, sample_sequence_data, config_email, backups, live,
         unreadable=(),
     ):
-        (temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": config_email, "accountUuid": "u"},
-        }))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {} if config_email is None else {
+                "oauthAccount": {"emailAddress": config_email, "accountUuid": "u"},
+            }
+        ))
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
@@ -7578,6 +7580,88 @@ class TestActiveSlotCrossCheck:
         # The usage row was filed under slot 2's registry identity.
         assert collected[0][0] == 2
         assert collected[0][1] == "account2@example.com"
+
+    def test_status_resolves_by_lineage_with_no_config_identity(
+        self, temp_home, sample_sequence_data,
+    ):
+        """A cleared/missing oauthAccount must not blind --status: a managed
+        live credential still names its slot by lineage (list already did)."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, None,
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-2"),
+        )
+        with patches[0], patches[1], patch.object(
+            switcher, "_collect_usage_entries",
+            side_effect=lambda info, **kw: {str(info[0][0]): UsageEntry()},
+        ):
+            payload = switcher._build_status_payload()
+        assert payload["active"]["number"] == 2
+        assert payload["active"]["email"] == "account2@example.com"
+        assert payload["activeSlotMismatch"]["configEmail"] is None
+
+    def test_status_usage_fetch_reuses_the_resolution_snapshot(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The live store is read once: resolution and the usage row must be
+        one snapshot, or a concurrent switch lands between the reads and
+        files the new account's usage under the resolved slot."""
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
+            live=self._creds("rt-1"),
+        )
+        with patches[0] as live_mock, patches[1], patch.object(
+            switcher, "_collect_usage_entries",
+            side_effect=lambda info, **kw: {str(info[0][0]): UsageEntry()},
+        ):
+            switcher._build_status_payload()
+        assert live_mock.call_count == 1
+
+    def test_switch_local_sweep_requires_exactly_one_owner(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Two slots sharing the live lineage (genuine duplicate) is ambiguous
+        — the local check must fall through to unresolved, not name a slot."""
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "account3@example.com",
+            "uuid": "uuid-3",
+            "added": "2024-01-03T00:00:00Z",
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        dup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-dup", "refreshToken": "rt-dup",
+        }})
+        own = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+        }})
+        backups = {"1": own, "2": dup, "3": dup}
+        data = switcher._get_sequence_data()
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=lambda num, email: backups.get(str(num), ""),
+        ):
+            kind, slot = switcher._classify_outgoing_credential(
+                "1", "account1@example.com", dup,
+                {"resolved": None, "live": dup}, data,
+            )
+        assert (kind, slot) == ("unresolved", None)
+        # The control: a single owner still classifies foreign-synced.
+        backups["3"] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-3", "refreshToken": "rt-3",
+        }})
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=lambda num, email: backups.get(str(num), ""),
+        ):
+            kind, slot = switcher._classify_outgoing_credential(
+                "1", "account1@example.com", dup,
+                {"resolved": None, "live": dup}, data,
+            )
+        assert (kind, slot) == ("foreign-synced", "2")
 
     def test_status_human_path_prints_the_corrected_slot(
         self, temp_home, sample_sequence_data, capsys,
