@@ -2430,6 +2430,43 @@ class TestActiveAccountRefresh:
             "1", "test@example.com", self._REFRESHED
         )
 
+    def test_resync_skips_on_incomplete_backup_evidence(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """An unreadable authoritative ``.enc`` silently serves the Keychain
+        fallback through the lossy reader; the resync must not conclude
+        "drifted" (overwrite) or "nothing drifted" (skip) from bytes that may
+        be a stale copy. Incomplete evidence leaves the backup untouched —
+        the documented read-error behavior — before any oracle probe."""
+        switcher = self._switcher(sample_sequence_data)
+
+        def fallback_read(num, email, failed=None):
+            if failed is not None:
+                failed.append("enc-unreadable")
+            return self._EXPIRED   # Keychain fallback bytes, stale lineage
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._REFRESHED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 side_effect=fallback_read,
+             ), \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=self._PROFILE_SELF) as mock_probe, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        assert result.usage == {"five_hour": {"pct": 3}}
+        mock_refresh.assert_not_called()
+        mock_probe.assert_not_called()   # evidence gate sits before the probe
+        write_backup.assert_not_called()
+
     def test_fresh_fetch_same_lineage_skips_the_resync(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -6693,16 +6730,27 @@ class TestProvenanceGuard:
         """The poisoning precondition: live bytes belong to another managed
         slot (uuid-positive). They must be preserved as a safety copy — not
         written into the outgoing slot, and not routed into the resolved slot
-        either (identity proves ownership, not generation freshness). Here the
-        foreign slot is also the switch target: the switch still activates the
-        target's *stored* backup, never the displaced live bytes."""
+        either (identity proves ownership, not generation freshness). The
+        foreign slot here is NOT the switch target (a target-owned live
+        lineage keeps the live login in place instead — covered separately);
+        the displaced bytes are stashed and the switch activates the
+        target's stored backup."""
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "account3@example.com",
+            "uuid": "uuid-3",
+            "added": "2024-01-03T00:00:00Z",
+        }
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
         creds_store[("1", "test@example.com")] = self._A1_BACKUP
         a2_backup = creds_store[("2", "account2@example.com")]
+        a3_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-3", "refreshToken": "rt-3",
+        }})
+        creds_store[("3", "account3@example.com")] = a3_backup
         foreign = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-2-rotated", "refreshToken": "rt-2-rotated",
+            "accessToken": "sk-3-rotated", "refreshToken": "rt-3-rotated",
         }})
         live_state = {"creds": foreign}
         patches = self._install_store_patches(
@@ -6710,7 +6758,7 @@ class TestProvenanceGuard:
         )
         try:
             op = self._run_switch(switcher, resolver={
-                "uuid": "uuid-2", "email": "account2@example.com",
+                "uuid": "uuid-3", "email": "account3@example.com",
                 "organizationUuid": "",
             })
         finally:
@@ -6718,15 +6766,15 @@ class TestProvenanceGuard:
                 p.stop()
         # Outgoing slot untouched; resolved slot untouched.
         assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
-        assert creds_store[("2", "account2@example.com")] == a2_backup
+        assert creds_store[("3", "account3@example.com")] == a3_backup
         # Foreign bytes preserved byte-exactly.
         entries = switcher.list_unclaimed_credentials()
         assert len(entries) == 1
         (entry_id,) = entries
         assert _read_safety_copy(switcher, entry_id) == foreign
-        assert entries[entry_id]["resolvedIdentity"]["uuid"] == "uuid-2"
+        assert entries[entry_id]["resolvedIdentity"]["uuid"] == "uuid-3"
         assert any(
-            "ownership mismatch" in w and "Account-2" in w
+            "ownership mismatch" in w and "Account-3" in w
             for w in op["warnings"]
         )
         # The switch itself proceeded, onto the stored backup.
@@ -6917,13 +6965,21 @@ class TestProvenanceGuard:
         """uuid+org is a positive cross-slot match even without an email —
         preserve-and-skip stays available where the evidence is complete
         enough to be positive."""
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "account3@example.com",
+            "uuid": "uuid-3",
+            "added": "2024-01-03T00:00:00Z",
+        }
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
         creds_store[("1", "test@example.com")] = self._A1_BACKUP
-        a2_backup = creds_store[("2", "account2@example.com")]
+        a3_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-3", "refreshToken": "rt-3",
+        }})
+        creds_store[("3", "account3@example.com")] = a3_backup
         foreign = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-2-rotated", "refreshToken": "rt-2-rotated",
+            "accessToken": "sk-3-rotated", "refreshToken": "rt-3-rotated",
         }})
         live_state = {"creds": foreign}
         patches = self._install_store_patches(
@@ -6931,15 +6987,15 @@ class TestProvenanceGuard:
         )
         try:
             op = self._run_switch(switcher, resolver={
-                "uuid": "uuid-2", "email": None, "organizationUuid": "",
+                "uuid": "uuid-3", "email": None, "organizationUuid": "",
             })
         finally:
             for p in patches:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
-        assert creds_store[("2", "account2@example.com")] == a2_backup
+        assert creds_store[("3", "account3@example.com")] == a3_backup
         assert len(switcher.list_unclaimed_credentials()) == 1
-        assert any("Account-2" in w for w in op["warnings"])
+        assert any("Account-3" in w for w in op["warnings"])
 
     def test_unresolvable_mismatch_backs_up_pre_fix(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7447,6 +7503,68 @@ class TestSelfSwitchProvenance:
             for p in patches:
                 p.stop()
         assert live_state["creds"] == slot1_backup
+
+    def test_switch_to_the_lineage_owner_keeps_its_newer_live_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """config=1, live bytes are slot 2's NEWER rotation (oracle-attributed
+        — the lineage matches no stored backup), target=2: restoring slot 2's
+        stored backup would move the account BACKWARD onto the consumed
+        predecessor it superseded — and writing the live bytes into the slot
+        is equally forbidden (identity proves ownership, not freshness). The
+        switch must keep the live login in place and repair only the config;
+        the lagging backup heals later via the collect-pass resync."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        slot1_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+            "expiresAt": 9999999999000}})
+        slot2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000}})
+        creds_store[("1", "test@example.com")] = slot1_backup
+        creds_store[("2", "account2@example.com")] = slot2_backup
+        configs_store[("1", "test@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com",
+                             "accountUuid": "uuid-1"}})
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-new", "refreshToken": "rt-2-new",
+            "expiresAt": 9999999999000}})
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        p = patch.object(
+            switcher, "_read_active_credentials",
+            side_effect=lambda: ActiveCredentials(
+                live_state.get("creds", ""), False, False
+            ),
+        )
+        p.start()
+        patches.append(p)
+        try:
+            with patch("claude_swap.oauth.fetch_oauth_profile",
+                       return_value={"uuid": "uuid-2",
+                                     "email": "account2@example.com",
+                                     "organizationUuid": ""}), \
+                 patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("2", "account2@example.com")] == slot2_backup, (
+            "no store write on unproven freshness: the lagging backup heals "
+            "via the collect-pass resync, not the switch"
+        )
+        live = json.loads(live_state["creds"])
+        assert live["claudeAiOauth"]["refreshToken"] == "rt-2-new", (
+            "activation must keep the newer live credential, not restore "
+            "the stale stored backup over it"
+        )
+        assert creds_store[("1", "test@example.com")] == slot1_backup
+        warnings = (result or {}).get("warnings", [])
+        assert any("kept in place" in w for w in warnings), warnings
 
     def test_rotation_resolves_by_lineage_with_no_config_identity(
         self, temp_home, mock_claude_config, sample_sequence_data,

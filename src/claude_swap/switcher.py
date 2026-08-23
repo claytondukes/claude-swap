@@ -4644,7 +4644,21 @@ class ClaudeAccountSwitcher:
                 and creds_oauth.get("refreshToken")
             ):
                 return  # never seed a backup with a partial token pair
-            backup = self._read_account_credentials(account_num, email)
+            # Graded evidence, not the lossy reader: on macOS an unreadable
+            # authoritative .enc silently serves the Keychain fallback, and
+            # both decisions below — "nothing drifted" (skip) and "drifted"
+            # (overwrite, possibly of a newer generation hiding behind the
+            # unreadable read) — would then rest on bytes that may be a stale
+            # copy. Incomplete evidence leaves the backup stale, exactly the
+            # documented read-error behavior.
+            backup, complete = self._read_backup_evidence(account_num, email)
+            if not complete:
+                self._logger.debug(
+                    "Account %s's backup read is incomplete (unreadable "
+                    "authoritative store); resync skipped this pass.",
+                    account_num,
+                )
+                return
             if backup and (
                 oauth.credential_fingerprint(creds)
                 == oauth.credential_fingerprint(backup)
@@ -7147,7 +7161,36 @@ class ClaudeAccountSwitcher:
                         .get("email", "")
                     )
                     from_ref = account_ref(int(foreign_slot), owner_email)
-                if kind in ("foreign", "alien", "known-foreign"):
+                # The live bytes provably belong to the TARGET slot: config
+                # drift routed the switch through the cross-slot path, but
+                # the account it is switching TO is already the one live.
+                # Step 3 restoring the stored backup could move the account
+                # BACKWARD onto a consumed predecessor (the live bytes may
+                # be a newer generation the backup lags) — and writing the
+                # live bytes into the slot is equally off the table
+                # (identity proves ownership, not generation freshness: an
+                # old synced copy would displace the slot's only current
+                # refresh token). So neither store moves: the live login is
+                # kept in place, only the config side is repaired, and the
+                # lagging backup heals through the collect-pass resync,
+                # which holds the freshness proof this path lacks (the
+                # server just accepted the live token).
+                keep_live = foreign_slot == target_account and kind in (
+                    "foreign", "foreign-synced"
+                )
+                if keep_live and kind == "foreign":
+                    msg = (
+                        "Credential ownership mismatch detected. The live "
+                        f"credential is already Account-{target_account}'s "
+                        "(a generation its stored backup may lag), so the "
+                        "live login was kept in place and only the "
+                        "configuration was repaired."
+                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+                elif kind in ("foreign", "alien", "known-foreign"):
                     # Positively not this slot's bytes: never into a slot;
                     # never silently destroyed. The safety copy (which raises
                     # on failure, aborting before the live store is
@@ -7272,9 +7315,14 @@ class ClaudeAccountSwitcher:
                             acct["uuid"] = resolved["uuid"]
                     self._logger.info(f"Backed up account {current_account}")
 
-                # Step 2: Retrieve target account
-                target_creds = self._read_target_credentials(
-                    target_account, target_email
+                # Step 2: Retrieve target account. With the target's own
+                # bytes already live, its stored backup is not consulted —
+                # it may lag the live generation, and the slot may not even
+                # have one yet (oracle attribution needs no backup).
+                target_creds = (
+                    None
+                    if keep_live
+                    else self._read_target_credentials(target_account, target_email)
                 )
                 target_config = self._read_account_config(target_account, target_email)
 
@@ -7284,14 +7332,23 @@ class ClaudeAccountSwitcher:
                         f"Re-add with: cswap --add-account --slot {target_account}"
                     )
 
-                # Step 3: Activate target account - credentials
-                self._write_credentials(
-                    self._prepare_credentials_for_activation(
-                        target_creds, original_creds
+                # Step 3: Activate target account - credentials. Skipped when
+                # the target's own bytes are already live (see keep_live):
+                # the credential store is already correct, and rewriting it
+                # from the stored backup is the backward move this guards.
+                if keep_live:
+                    self._logger.info(
+                        f"Live credential already belongs to account "
+                        f"{target_account}; kept in place (config repair only)"
                     )
-                )
-                transaction.record_step("credentials_written")
-                self._logger.info("Wrote target credentials")
+                else:
+                    self._write_credentials(
+                        self._prepare_credentials_for_activation(
+                            target_creds, original_creds
+                        )
+                    )
+                    transaction.record_step("credentials_written")
+                    self._logger.info("Wrote target credentials")
 
                 # Step 4: Update config with target oauthAccount
                 target_config_data = json.loads(target_config)

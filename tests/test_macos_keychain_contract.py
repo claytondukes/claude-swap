@@ -223,6 +223,39 @@ class TestActiveWriteCoversResolvedServices:
         assert store._last_active_credentials_backend == "file"
         assert suffixed in deleted
 
+    def test_partial_write_undo_restores_an_empty_prior_instead_of_deleting(
+        self, macos_switcher, monkeypatch, temp_home
+    ):
+        """``get_password`` returns ``""`` for an item that EXISTS with an
+        empty secret (rc 0, bare newline) and ``None`` only for a genuine
+        miss (rc 44). The undo must restore such an item to its empty prior,
+        not treat it as absent and delete it — if the file fallback then also
+        failed, the deletion would lose the item instead of restoring it."""
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.session import keychain_service_name
+
+        exported = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        suffixed = keychain_service_name(exported)
+        writes: list[tuple[str, str]] = []
+
+        def set_password(service, account, value):
+            if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                raise _kc.KeychainError("locked")
+            writes.append((service, value))
+
+        monkeypatch.setattr(_kc, "get_password", lambda service, account: "")
+        monkeypatch.setattr(_kc, "set_password", set_password)
+        monkeypatch.setattr(_kc, "delete_password", lambda service, account: None)
+        store._write_oauth_credentials(self.OAUTH)
+        assert store._last_active_credentials_backend == "file"
+        # New credential in, then the undo restored the EMPTY prior — a
+        # delete here would be the undo destroying the item it must preserve.
+        assert writes == [(suffixed, self.OAUTH), (suffixed, "")]
+
 
 class TestBackupCredentialsSecurity:
     """Mocked tests for the macOS backup-creds path: assert the correct

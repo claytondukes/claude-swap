@@ -107,6 +107,36 @@ def _active_oauth_keychain_services() -> list[str]:
     return services
 
 
+def _secure_store_redirect_mismatch() -> tuple[Path, Path] | None:
+    """The (selected, written) plaintext dirs when they diverge, else ``None``.
+
+    Claude sources its *plaintext* credential file from the same secure-storage
+    profile as its Keychain service (``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when
+    defined, defined-but-empty meaning the default profile), while
+    ``get_credentials_path()`` follows only ``CLAUDE_CONFIG_DIR``. When the two
+    diverge, a plaintext write here lands in a file Claude never reads for this
+    environment — a switch would report success while Claude stays on the old
+    account — and overwrites whatever profile DOES own that file. Callers must
+    refuse (writes) or skip (best-effort bumps) instead.
+
+    Unresolvable paths count as diverged: assuming an unknown path is the
+    selected store is what licenses the misrouted write this guards against.
+    """
+    secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if secure_env is None:
+        return None
+    selected = Path(secure_env) if secure_env else get_default_claude_config_home()
+    written = get_claude_config_home()
+    if selected == written:
+        return None
+    try:
+        if selected.resolve() == written.resolve():
+            return None
+    except Exception:
+        pass
+    return selected, written
+
+
 def _active_oauth_keychain_write_services() -> list[str]:
     """Keychain services an active-credential WRITE (or delete) must cover.
 
@@ -1049,7 +1079,22 @@ class CredentialStore:
         # File mode: non-macOS, macOS Keychain known unusable, or a Keychain write
         # that just failed. Write the plaintext file and (macOS) best-effort clear
         # any stale Keychain entry so Claude Code's keychain-first read can't shadow
-        # it (#30337).
+        # it (#30337). Refused outright when the secure-storage profile selects a
+        # different plaintext directory than the env-following path written below:
+        # the write would land in a file Claude never reads (the switch "succeeds"
+        # while Claude stays on the old account) and overwrite the profile that
+        # DOES own that file — the same store-unmirrored posture the consume and
+        # refresh paths already take (deterministic, self-inflicted, must surface).
+        mismatch = _secure_store_redirect_mismatch()
+        if mismatch is not None:
+            selected, written_dir = mismatch
+            raise CredentialWriteError(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR redirects Claude's credential "
+                f"store to {selected}, but the plaintext fallback writes "
+                f"{written_dir / '.credentials.json'} — a file Claude would not "
+                "read. Refusing to write; unset the variable or run from a "
+                "normal shell."
+            )
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
@@ -1079,7 +1124,12 @@ class CredentialStore:
         account = macos_keychain.keychain_account_name()
         for service, prior in written:
             try:
-                if prior:
+                # `is not None`, not truthiness: get_password returns "" for
+                # an item that EXISTS with an empty secret (rc 0, bare
+                # newline) and None only for a genuine miss (rc 44). Deleting
+                # on "" would turn the undo into the loss it exists to
+                # prevent when the file fallback below also fails.
+                if prior is not None:
                     macos_keychain.set_password(service, account, prior)
                 else:
                     macos_keychain.delete_password(service, account)
@@ -1103,6 +1153,12 @@ class CredentialStore:
         succeeded, so a failure here must not fail the switch — it only means a
         running session may lag until restart.
         """
+        if _secure_store_redirect_mismatch() is not None:
+            # The env-following file belongs to a DIFFERENT profile than the
+            # secure store just written: bumping it would overwrite that
+            # profile's seed with this profile's credential. The Keychain
+            # write above is the one Claude reads here; skip the bump.
+            return
         cred_file = get_credentials_path()
         if not cred_file.exists():
             return

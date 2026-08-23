@@ -26,6 +26,7 @@ from claude_swap.credentials import (
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
     CredentialStore,
 )
+from claude_swap.exceptions import CredentialWriteError
 from claude_swap.models import Platform
 from claude_swap.session import keychain_service_name
 
@@ -271,3 +272,114 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestSecureStoreFileWriteRefusal:
+    """File-mode writes must not land in a file Claude does not read.
+
+    Claude sources its *plaintext* credential file from the same secure-storage
+    profile as its Keychain service (``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when
+    defined), while the store's file backend follows only ``CLAUDE_CONFIG_DIR``.
+    With the two diverged, a fallback write would report a successful switch
+    while Claude keeps reading the old account — and overwrite whatever
+    profile DOES own the env-following file. The write refuses instead (the
+    same store-unmirrored posture the consume and refresh paths take), and the
+    post-Keychain shadow-file bump skips for the same reason.
+    """
+
+    def test_file_mode_refuses_a_diverged_secure_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        secure = tmp_path / "secure-profile"
+        secure.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        host = _Host(tmp_path / "backups")
+        host.platform = Platform.LINUX  # file mode unconditionally
+        store = CredentialStore(host)
+        with pytest.raises(CredentialWriteError) as exc:
+            store._write_oauth_credentials(SECURE_PROFILE_CREDS)
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in str(exc.value)
+        assert not (custom / ".credentials.json").exists(), (
+            "the refused write must not leave a credential in a file Claude "
+            "does not read for this environment"
+        )
+
+    def test_file_mode_defined_but_empty_diverges_from_a_custom_config_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Defined-but-empty selects the DEFAULT store (``~/.claude``); with a
+        custom ``CLAUDE_CONFIG_DIR`` the file backend still writes elsewhere —
+        diverged, refused."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        host = _Host(tmp_path / "backups")
+        host.platform = Platform.LINUX
+        store = CredentialStore(host)
+        with pytest.raises(CredentialWriteError):
+            store._write_oauth_credentials(DEFAULT_PROFILE_CREDS)
+        assert not (custom / ".credentials.json").exists()
+
+    def test_file_mode_proceeds_when_the_stores_coincide(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The redirect naming the same directory the file backend writes is
+        one store seen twice — no divergence, the write must proceed."""
+        profile = tmp_path / "one-profile"
+        profile.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(profile))
+
+        host = _Host(tmp_path / "backups")
+        host.platform = Platform.LINUX
+        store = CredentialStore(host)
+        store._write_oauth_credentials(SECURE_PROFILE_CREDS)
+        assert (
+            (profile / ".credentials.json").read_text(encoding="utf-8")
+            == SECURE_PROFILE_CREDS
+        )
+        assert store._last_active_credentials_backend == "file"
+
+    def test_keychain_write_skips_the_shadow_bump_under_a_diverged_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On macOS with a healthy Keychain the redirected write is correct —
+        but the post-write mtime bump follows ``CLAUDE_CONFIG_DIR`` and would
+        overwrite ANOTHER profile's plaintext seed with this profile's
+        credential. It must skip, leaving that file untouched."""
+        custom = tmp_path / "custom-profile"
+        custom.mkdir()
+        secure = tmp_path / "secure-profile"
+        secure.mkdir()
+        (custom / ".credentials.json").write_text(
+            CUSTOM_PROFILE_CREDS, encoding="utf-8"
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        writes: list[str] = []
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            lambda service, account: None,
+        )
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.set_password",
+            lambda service, account, value: writes.append(service),
+        )
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._keychain_usable_cache = True
+        store._write_oauth_credentials(SECURE_PROFILE_CREDS)
+        assert store._last_active_credentials_backend == "keychain"
+        assert writes == [keychain_service_name(str(secure))]
+        assert (
+            (custom / ".credentials.json").read_text(encoding="utf-8")
+            == CUSTOM_PROFILE_CREDS
+        ), "the shadow bump must not overwrite another profile's seed"
