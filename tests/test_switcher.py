@@ -7861,6 +7861,39 @@ class TestActiveSlotCrossCheck:
         })
         assert (kind, slot) == ("own-family", None)
 
+    def test_partial_oracle_answer_still_consults_local_evidence(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An inconclusive PARTIAL oracle response (uuid-only, mapping to no
+        slot) must not bypass the offline owner scan: the fingerprint
+        evidence is decisive locally, and falling straight to unresolved
+        would fail-open-write the foreign bytes into the config-named slot."""
+        switcher = self._three_slot_switcher(sample_sequence_data)
+        backups = {
+            "1": (self._OWN, False),
+            "2": (self._DUP, False),
+            "3": (self._THIRD, False),
+        }
+        data = switcher._get_sequence_data()
+        partial = {"uuid": "uuid-unknown", "email": "", "organizationUuid": None}
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=lambda num, email, failed=None: (
+                backups.get(str(num), ("", False))[0]
+            ),
+        ), patch.object(
+            switcher, "_read_backup_evidence",
+            side_effect=lambda num, email: (
+                backups.get(str(num), ("", False))[0],
+                not backups.get(str(num), ("", False))[1],
+            ),
+        ):
+            kind, slot = switcher._classify_outgoing_credential(
+                "1", "account1@example.com", self._DUP,
+                {"resolved": partial, "live": self._DUP}, data,
+            )
+        assert (kind, slot) == ("foreign-synced", "2")
+
     def test_switch_local_sweep_no_owner_stays_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

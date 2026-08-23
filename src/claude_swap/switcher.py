@@ -6458,49 +6458,61 @@ class ClaudeAccountSwitcher:
             live_oauth.get("accessToken") or live_oauth.get("refreshToken")
         ):
             return ("wiped", None)
+        def _local_owner_verdict() -> tuple[str, str | None] | None:
+            """LOCAL lineage evidence before any "unresolved" concession.
+
+            Bytes whose refresh-token lineage matches another managed slot's
+            stored backup are that slot's — the same offline proof
+            ``_resolve_active_slot`` uses, and it needs no oracle. This
+            closes the split-brain poisoning the fail-open would otherwise
+            commit: config names slot A, the live store holds slot B's
+            byte-copied credential, the oracle is down OR answered something
+            unmappable (a partial profile) — the pre-fix backup would write
+            B's only refresh token into A. Local reads only (the switch
+            locks are held; no network). Returns None when the bytes match
+            no readable slot: rotation-shaped divergence, the caller's
+            fail-open applies.
+            """
+            live_fp = oauth.credential_fingerprint(original_creds)
+            if not live_fp:
+                return None
+            owners: list[str] = []
+            # The CURRENT slot's read counts toward completeness too: an
+            # unreadable own-backup silently skipped the own-bytes /
+            # own-family checks above, so "these bytes are foreign" is
+            # only as strong as that read.
+            evidence_incomplete = not backup_complete
+            for num, acct in data.get("accounts", {}).items():
+                if num == current_account:
+                    continue
+                other, complete = self._read_backup_evidence(
+                    num, acct.get("email", "")
+                )
+                evidence_incomplete = evidence_incomplete or not complete
+                if other and oauth.credential_fingerprint(other) == live_fp:
+                    owners.append(num)
+            if len(owners) == 1 and not evidence_incomplete:
+                # Complete, unique evidence: that slot's stored backup
+                # already holds this exact lineage, so nothing needs
+                # preserving and nothing may be written.
+                return ("foreign-synced", owners[0])
+            if owners:
+                # A readable slot holds this exact lineage, so the bytes
+                # are positively NOT this slot's and the fail-open write
+                # is off the table. But "already synced, nothing to
+                # preserve" is NOT provable: an unreadable slot could
+                # hold the lineage too (its copy uninspectable), or
+                # several readable ones do (genuine duplicate — naming
+                # one is a guess). Route as "foreign": stash the live
+                # bytes as a safety copy and write nothing anywhere.
+                return ("foreign", owners[0])
+            return None
+
         resolved = provenance.get("resolved")
         if resolved is None or provenance.get("live") != original_creds:
-            # LOCAL lineage evidence before conceding "unresolved": bytes
-            # whose refresh-token lineage matches another managed slot's
-            # stored backup are that slot's — the same offline proof
-            # _resolve_active_slot uses, and it needs no oracle. This closes
-            # the split-brain poisoning the fail-open below could still
-            # commit: config names slot A, the live store holds slot B's
-            # byte-copied credential, the profile probe is down — the
-            # pre-fix backup would write B's only refresh token into A.
-            # Local reads only (the switch locks are held; no network).
-            live_fp = oauth.credential_fingerprint(original_creds)
-            if live_fp:
-                owners: list[str] = []
-                # The CURRENT slot's read counts toward completeness too: an
-                # unreadable own-backup silently skipped the own-bytes /
-                # own-family checks above, so "these bytes are foreign" is
-                # only as strong as that read.
-                evidence_incomplete = not backup_complete
-                for num, acct in data.get("accounts", {}).items():
-                    if num == current_account:
-                        continue
-                    other, complete = self._read_backup_evidence(
-                        num, acct.get("email", "")
-                    )
-                    evidence_incomplete = evidence_incomplete or not complete
-                    if other and oauth.credential_fingerprint(other) == live_fp:
-                        owners.append(num)
-                if len(owners) == 1 and not evidence_incomplete:
-                    # Complete, unique evidence: that slot's stored backup
-                    # already holds this exact lineage, so nothing needs
-                    # preserving and nothing may be written.
-                    return ("foreign-synced", owners[0])
-                if owners:
-                    # A readable slot holds this exact lineage, so the bytes
-                    # are positively NOT this slot's and the fail-open write
-                    # below is off the table. But "already synced, nothing to
-                    # preserve" is NOT provable: an unreadable slot could
-                    # hold the lineage too (its copy uninspectable), or
-                    # several readable ones do (genuine duplicate — naming
-                    # one is a guess). Route as "foreign": stash the live
-                    # bytes as a safety copy and write nothing anywhere.
-                    return ("foreign", owners[0])
+            verdict = _local_owner_verdict()
+            if verdict:
+                return verdict
             if self._probe_verdicts.get(
                 self._lineage_key(
                     current_account, current_email,
@@ -6554,7 +6566,13 @@ class ClaudeAccountSwitcher:
             # any other oracle degradation, not preserve-and-skip.
             if r_email and resolved.get("organizationUuid") is not None:
                 return ("alien", None)
-            return ("unresolved", None)
+            # An inconclusive PARTIAL oracle answer (e.g. uuid-only mapping
+            # to no slot) must not bypass the offline proof the oracle-silent
+            # branch consults: with config=A and live bytes byte-copied from
+            # B, falling straight to unresolved would fail-open-write B's
+            # credential into A even though the fingerprint evidence is
+            # decisive locally.
+            return _local_owner_verdict() or ("unresolved", None)
         # A cross-slot attribution must be uuid-positive: an email+org match
         # against a slot with no recorded uuid (add-token placeholder) is not
         # evidence enough to name that slot in user output — treat as alien.
