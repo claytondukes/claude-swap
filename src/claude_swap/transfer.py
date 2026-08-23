@@ -209,8 +209,14 @@ def export_accounts(
     # during that same split-brain the live config's oauthAccount still
     # names A, and exporting it under B's row would restore the wrong
     # identity on import; B's stored backup config is the right one.
-    active_num = switcher.current_account_number()
+    # The resolver's ActiveCredentials snapshot is ALSO what the active row
+    # exports: re-reading the live store here would let a concurrent
+    # refresh/switch land between resolution and emission and re-create the
+    # very mislabeling this is guarding against.
     config_identity = switcher._get_current_account()
+    active_num, _mismatch, live_snapshot = switcher._resolve_status_slot(
+        sequence_data, config_identity
+    )
 
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
@@ -221,7 +227,7 @@ def export_accounts(
         is_active = num == active_num
 
         if is_active:
-            creds_text = switcher._read_credentials()
+            creds_text = live_snapshot.value or ""
             if not creds_text:
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"

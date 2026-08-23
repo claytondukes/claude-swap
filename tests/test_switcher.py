@@ -2363,6 +2363,42 @@ class TestActiveAccountRefresh:
             call("1", "test@example.com", self._REFRESHED),
         ]
 
+    def test_resync_proceeds_when_config_identity_is_stale(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Split-brain resync: a still-running old session rewrote
+        oauthAccount to ANOTHER account, but the oracle affirmed the rotated
+        lineage as this slot's and the under-lock re-read still carries it.
+        Requiring the config identity to also agree rejected every such
+        resync, so the slot's backup kept the consumed predecessor and the
+        next recovery POSTed a dead grant — invalid_grant on a healthy
+        account (the field failure that forced repeated re-adds)."""
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "other@example.com",
+                             "accountUuid": "uuid-other"},
+        }))
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._REFRESHED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 return_value=self._EXPIRED,
+             ), \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=self._PROFILE_SELF), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED
+        )
+
     def test_fresh_fetch_same_lineage_skips_the_resync(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -3115,7 +3151,7 @@ class TestPerformSwitchPostDisplay:
         with "Claude wants to use the confidential information stored in your
         keychain" during the test run).
         """
-        def read_creds(num, email):
+        def read_creds(num, email, failed=None):
             return creds_store.get((str(num), email), "")
 
         def read_creds_ex(num, email):
@@ -7356,9 +7392,9 @@ class TestActiveSlotCrossCheck:
                 return_value=ActiveCredentials(live, False, False),
             ),
             patch.object(
-                switcher, "_read_account_credentials_ex",
+                switcher, "_read_backup_evidence",
                 side_effect=lambda num, email: (
-                    backups.get(str(num), ""), str(num) in unreadable
+                    backups.get(str(num), ""), str(num) not in unreadable
                 ),
             ),
         ]
@@ -7487,6 +7523,28 @@ class TestActiveSlotCrossCheck:
             info = switcher._build_accounts_info()
         assert [i[4] for i in info] == [True, False]
         assert switcher._active_mismatch() is None
+
+    def test_degraded_api_key_still_resolves_by_lineage(
+        self, temp_home, sample_sequence_data,
+    ):
+        """A managed API key lives on a separate auth axis: `degraded` there
+        only means the (irrelevant) OAuth Keychain read failed, keys never
+        rotate, and the value is authoritative — an OAuth-Keychain outage
+        must not blind the override for API-key accounts."""
+        key = "sk-ant-api03-managed-key-value"
+        switcher, patches = self._switcher(
+            temp_home, sample_sequence_data, "account1@example.com",
+            backups={"1": self._creds("rt-1"), "2": key},
+            live=key,
+        )
+        patches[0] = patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(key, False, True),  # degraded
+        )
+        with patches[0], patches[1]:
+            info = switcher._build_accounts_info()
+        assert [i[4] for i in info] == [False, True]
+        assert switcher._active_mismatch()["activeSlot"] == "2"
 
     def test_missing_config_identity_gets_the_no_login_wording(
         self, temp_home, sample_sequence_data,
@@ -7641,14 +7699,19 @@ class TestActiveSlotCrossCheck:
     }})
 
     def _classify(self, switcher, backups):
-        """backups: slot -> (value, unreadable) for the _ex reader."""
+        """backups: slot -> (value, unreadable) for the evidence reader."""
         data = switcher._get_sequence_data()
         with patch.object(
             switcher, "_read_account_credentials",
-            side_effect=lambda num, email: backups.get(str(num), ("", False))[0],
+            side_effect=lambda num, email, failed=None: (
+                backups.get(str(num), ("", False))[0]
+            ),
         ), patch.object(
-            switcher, "_read_account_credentials_ex",
-            side_effect=lambda num, email: backups.get(str(num), ("", False)),
+            switcher, "_read_backup_evidence",
+            side_effect=lambda num, email: (
+                backups.get(str(num), ("", False))[0],
+                not backups.get(str(num), ("", False))[1],
+            ),
         ):
             return switcher._classify_outgoing_credential(
                 "1", "account1@example.com", self._DUP,
