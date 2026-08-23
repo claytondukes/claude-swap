@@ -107,6 +107,60 @@ def _active_oauth_keychain_services() -> list[str]:
     return services
 
 
+def _secure_store_redirect_mismatch() -> tuple[Path, Path] | None:
+    """The (selected, written) plaintext dirs when they diverge, else ``None``.
+
+    Claude sources its *plaintext* credential file from the same secure-storage
+    profile as its Keychain service (``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when
+    defined, defined-but-empty meaning the default profile), while
+    ``get_credentials_path()`` follows only ``CLAUDE_CONFIG_DIR``. When the two
+    diverge, a plaintext write here lands in a file Claude never reads for this
+    environment — a switch would report success while Claude stays on the old
+    account — and overwrites whatever profile DOES own that file. Callers must
+    refuse (writes) or skip (best-effort bumps) instead.
+
+    Unresolvable paths count as diverged: assuming an unknown path is the
+    selected store is what licenses the misrouted write this guards against.
+    """
+    secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if secure_env is None:
+        return None
+    selected = Path(secure_env) if secure_env else get_default_claude_config_home()
+    written = get_claude_config_home()
+    if selected == written:
+        return None
+    try:
+        if selected.resolve() == written.resolve():
+            return None
+    except Exception:
+        pass
+    return selected, written
+
+
+def _active_oauth_keychain_write_services() -> list[str]:
+    """Keychain services an active-credential WRITE (or delete) must cover.
+
+    The same resolution as :func:`_active_oauth_keychain_services`, and for the
+    same reason in mirror image: whatever items the active environment's Claude
+    may READ must all see the new credential, or a switch performed here is
+    invisible somewhere else. The failure this closes: with a global
+    ``CLAUDE_CONFIG_DIR`` export naming the default profile, Claude reads the
+    *suffixed* item while the historic write path updated only the unsuffixed
+    one — the switch backed up the outgoing credential correctly (read path,
+    suffixed-first) and then activated the target into an item the user's
+    Claude never reads, so every new session silently stayed on the old
+    account and rewrote ``oauthAccount`` back, re-creating the split-brain.
+
+    In the default-profile-alias case both names are one logical store seen
+    from different environments (shells with the export vs launchd agents and
+    GUI-launched apps without it), so both are written and the two can never
+    drift. This deliberately updates/creates Claude's hashed entry for the
+    ACTIVE environment only — the session-module rule against seeding hashed
+    entries for *other* profiles cswap isn't running in still stands.
+    """
+    return _active_oauth_keychain_services()
+
+
 # Service name for per-account backup credentials now managed via the ``security``
 # CLI on macOS. Deliberately distinct from KEYRING_SERVICE so old keyring items and
 # new security items coexist during migration (safe write → verify → delete).
@@ -783,16 +837,23 @@ class CredentialStore:
         returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
         a return is proof — which is the fact ``_pin_file_mode`` needs and used
         to discard. Off macOS there is no Keychain item, hence ``True``.
+
+        Sweeps every service the active environment resolves (see
+        ``_active_oauth_keychain_write_services``): Claude reads its hashed
+        per-``CLAUDE_CONFIG_DIR`` item before the plaintext file too, so a
+        stale suffixed entry shadows the file exactly like the unsuffixed one.
         """
         if self._host.platform != Platform.MACOS:
             return True
-        try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
-        except Exception:
-            return False  # best-effort; a down Keychain can't be cleaned now
-        return True
+        cleared = True
+        for service in _active_oauth_keychain_write_services():
+            try:
+                macos_keychain.delete_password(
+                    service, macos_keychain.keychain_account_name()
+                )
+            except Exception:
+                cleared = False  # best-effort; a down Keychain can't be cleaned now
+        return cleared
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
@@ -972,17 +1033,41 @@ class CredentialStore:
             CredentialWriteError: If writing credentials fails.
         """
         if self._use_keychain():
+            account = macos_keychain.keychain_account_name()
+            # (service, prior value) for each item already updated this call —
+            # the undo list for a partial multi-service write.
+            written: list[tuple[str, str | None]] = []
             try:
-                self._kc_call(
-                    macos_keychain.set_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
-                    macos_keychain.keychain_account_name(),
-                    credentials,
-                )
+                # Every service the active environment's read path resolves.
+                # Prior values are captured first so a later service failing
+                # can UNDO the earlier writes: without the undo, one item
+                # serves the new account while another still serves the old
+                # one, and which account a reader sees depends on its
+                # environment — the exact split this multi-service write
+                # exists to prevent. ALL priors are read before the FIRST
+                # write: a later prior-read failing after an earlier write
+                # would leave the undo racing the same broken Keychain it
+                # needs, while reads-then-writes aborts with nothing yet
+                # written. The file path below also sweeps every item, but
+                # only after ITS write succeeds; consistency must not depend
+                # on that.
+                services = _active_oauth_keychain_write_services()
+                priors = {
+                    service: self._kc_call(
+                        macos_keychain.get_password, service, account
+                    )
+                    for service in services
+                }
+                for service in services:
+                    self._kc_call(
+                        macos_keychain.set_password, service, account, credentials
+                    )
+                    written.append((service, priors[service]))
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)
                 self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
+                self._undo_partial_keychain_write(written)
             else:
                 # Keychain (primary) now holds the fresh credential. Bump an
                 # already-present shadow file's mtime so running sessions hot-reload
@@ -994,7 +1079,22 @@ class CredentialStore:
         # File mode: non-macOS, macOS Keychain known unusable, or a Keychain write
         # that just failed. Write the plaintext file and (macOS) best-effort clear
         # any stale Keychain entry so Claude Code's keychain-first read can't shadow
-        # it (#30337).
+        # it (#30337). Refused outright when the secure-storage profile selects a
+        # different plaintext directory than the env-following path written below:
+        # the write would land in a file Claude never reads (the switch "succeeds"
+        # while Claude stays on the old account) and overwrite the profile that
+        # DOES own that file — the same store-unmirrored posture the consume and
+        # refresh paths already take (deterministic, self-inflicted, must surface).
+        mismatch = _secure_store_redirect_mismatch()
+        if mismatch is not None:
+            selected, written_dir = mismatch
+            raise CredentialWriteError(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR redirects Claude's credential "
+                f"store to {selected}, but the plaintext fallback writes "
+                f"{written_dir / '.credentials.json'} — a file Claude would not "
+                "read. Refusing to write; unset the variable or run from a "
+                "normal shell."
+            )
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
@@ -1008,6 +1108,33 @@ class CredentialStore:
             # authority, so hand it over rather than re-deriving it from flags.
             self._pin_file_mode(residual_cleared=cleared)
         self._last_active_credentials_backend = "file"
+
+    def _undo_partial_keychain_write(
+        self, written: list[tuple[str, str | None]]
+    ) -> None:
+        """Best-effort undo after a multi-service write failed partway through.
+
+        Restores each already-updated item to its prior value (deleting one
+        that had none) so no two services tell different stories while the
+        caller falls back to the file. Raw ``macos_keychain`` calls, each
+        independently best-effort: the capability cache has already flipped,
+        and a failed undo leaves at worst the pre-undo state — the file path's
+        delete sweep still runs after a successful file write.
+        """
+        account = macos_keychain.keychain_account_name()
+        for service, prior in written:
+            try:
+                # `is not None`, not truthiness: get_password returns "" for
+                # an item that EXISTS with an empty secret (rc 0, bare
+                # newline) and None only for a genuine miss (rc 44). Deleting
+                # on "" would turn the undo into the loss it exists to
+                # prevent when the file fallback below also fails.
+                if prior is not None:
+                    macos_keychain.set_password(service, account, prior)
+                else:
+                    macos_keychain.delete_password(service, account)
+            except Exception:
+                continue
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
         """Bump an already-present ``.credentials.json``'s mtime after a Keychain write.
@@ -1026,6 +1153,12 @@ class CredentialStore:
         succeeded, so a failure here must not fail the switch — it only means a
         running session may lag until restart.
         """
+        if _secure_store_redirect_mismatch() is not None:
+            # The env-following file belongs to a DIFFERENT profile than the
+            # secure store just written: bumping it would overwrite that
+            # profile's seed with this profile's credential. The Keychain
+            # write above is the one Claude reads here; skip the bump.
+            return
         cred_file = get_credentials_path()
         if not cred_file.exists():
             return

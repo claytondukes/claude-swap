@@ -2022,3 +2022,56 @@ class TestForceOverwriteNarratesTheStrikeClear:
         assert "same credential generation" in err
         assert "invalid_grant" not in err
         assert "refresh-token generation" not in err
+
+
+class TestExportActiveSlotByLineage:
+    """config=A / live=B split-brain: the export must label the live bytes by
+    LINEAGE, and must not carry the live config's identity onto B's row."""
+
+    def test_export_labels_live_bytes_by_lineage_not_config(
+        self, temp_home: Path
+    ):
+        s = _linux_switcher(temp_home)
+        alice_backup = {"claudeAiOauth": {
+            "accessToken": "sk-alice", "refreshToken": "rt-alice",
+            "expiresAt": 9999999999000}}
+        bob_backup = {"claudeAiOauth": {
+            "accessToken": "sk-bob-old", "refreshToken": "rt-bob",
+            "expiresAt": 9999999999000}}
+        _seed_account(s, 1, "alice@example.com", creds=alice_backup)
+        _seed_account(s, 2, "bob@example.com", creds=bob_backup)
+
+        # Config still names alice; the live store holds bob's lineage with
+        # a fresher access token (the split-brain a stale oauthAccount makes).
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "alice@example.com",
+            "accountUuid": "acct-1",
+            "organizationUuid": "",
+            "organizationName": "",
+        }})
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bob-live", "refreshToken": "rt-bob",
+            "expiresAt": 9999999999000}})
+        s._store._write_active_credentials_file(live)
+
+        out = temp_home / "all.cswap"
+        export_accounts(s, str(out))
+        envelope = json.loads(out.read_text())
+        rows = {r["number"]: r for r in envelope["accounts"]}
+
+        # The envelope agrees with the rows: the lineage-resolved slot, not
+        # the recorded roster marker the stale config left behind.
+        assert envelope["activeAccountNumber"] == 2
+
+        # Alice's row: her own backup — NOT the live (bob's) bytes the old
+        # config-identity compare exported under her name.
+        assert rows[1]["credentials"]["claudeAiOauth"]["refreshToken"] == "rt-alice"
+        # Bob's row: the live bytes (fresher generation of his lineage)...
+        assert rows[2]["credentials"]["claudeAiOauth"]["accessToken"] == "sk-bob-live"
+        # ...but HIS stored config identity, not the live config's (alice's).
+        assert (
+            rows[2]["config"]["oauthAccount"]["emailAddress"]
+            == "bob@example.com"
+        )
