@@ -6327,6 +6327,11 @@ class ClaudeAccountSwitcher:
           the split-brain state is byte-copied, so it is provable offline,
           and conceding "unresolved" there let the fail-open backup poison
           the config-named slot with another account's only refresh token.
+          The local proof requires COMPLETE, UNIQUE evidence (every other
+          slot readable, exactly one match); a match with holes or
+          ambiguity in the evidence routes as ``"foreign"`` instead — the
+          bytes are still provably not this slot's, but "nothing needs
+          preserving" is not provable, so they are stashed.
         - ``"wiped"``          — an OAuth blob whose token fields are all
           empty: Claude Code's ``invalid_grant`` reaction empties
           ``accessToken``/``refreshToken`` in place, keeping the wrapper and
@@ -6384,21 +6389,32 @@ class ClaudeAccountSwitcher:
             # Local reads only (the switch locks are held; no network).
             live_fp = oauth.credential_fingerprint(original_creds)
             if live_fp:
-                owners = [
-                    num
-                    for num, acct in data.get("accounts", {}).items()
-                    if num != current_account
-                    and (other := self._read_account_credentials(
+                owners: list[str] = []
+                others_unreadable = False
+                for num, acct in data.get("accounts", {}).items():
+                    if num == current_account:
+                        continue
+                    other, failed = self._read_account_credentials_ex(
                         num, acct.get("email", "")
-                    ))
-                    and oauth.credential_fingerprint(other) == live_fp
-                ]
-                # Exactly one, same rule as _resolve_active_slot: two slots
-                # sharing the lineage is the genuine-duplicate corruption,
-                # where naming either would be a guess — fall through to the
-                # verdict machinery below instead.
-                if len(owners) == 1:
+                    )
+                    others_unreadable = others_unreadable or failed
+                    if other and oauth.credential_fingerprint(other) == live_fp:
+                        owners.append(num)
+                if len(owners) == 1 and not others_unreadable:
+                    # Complete, unique evidence: that slot's stored backup
+                    # already holds this exact lineage, so nothing needs
+                    # preserving and nothing may be written.
                     return ("foreign-synced", owners[0])
+                if owners:
+                    # A readable slot holds this exact lineage, so the bytes
+                    # are positively NOT this slot's and the fail-open write
+                    # below is off the table. But "already synced, nothing to
+                    # preserve" is NOT provable: an unreadable slot could
+                    # hold the lineage too (its copy uninspectable), or
+                    # several readable ones do (genuine duplicate — naming
+                    # one is a guess). Route as "foreign": stash the live
+                    # bytes as a safety copy and write nothing anywhere.
+                    return ("foreign", owners[0])
             if self._probe_verdicts.get(
                 self._lineage_key(
                     current_account, current_email,

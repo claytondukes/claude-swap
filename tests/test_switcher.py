@@ -7618,11 +7618,7 @@ class TestActiveSlotCrossCheck:
             switcher._build_status_payload()
         assert live_mock.call_count == 1
 
-    def test_switch_local_sweep_requires_exactly_one_owner(
-        self, temp_home, mock_claude_config, sample_sequence_data,
-    ):
-        """Two slots sharing the live lineage (genuine duplicate) is ambiguous
-        — the local check must fall through to unresolved, not name a slot."""
+    def _three_slot_switcher(self, sample_sequence_data):
         sample_sequence_data["sequence"] = [1, 2, 3]
         sample_sequence_data["accounts"]["3"] = {
             "email": "account3@example.com",
@@ -7632,36 +7628,86 @@ class TestActiveSlotCrossCheck:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
-        dup = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-dup", "refreshToken": "rt-dup",
-        }})
-        own = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-1", "refreshToken": "rt-1",
-        }})
-        backups = {"1": own, "2": dup, "3": dup}
+        return switcher
+
+    _DUP = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-dup", "refreshToken": "rt-dup",
+    }})
+    _OWN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-1", "refreshToken": "rt-1",
+    }})
+    _THIRD = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-3", "refreshToken": "rt-3",
+    }})
+
+    def _classify(self, switcher, backups):
+        """backups: slot -> (value, unreadable) for the _ex reader."""
         data = switcher._get_sequence_data()
         with patch.object(
             switcher, "_read_account_credentials",
-            side_effect=lambda num, email: backups.get(str(num), ""),
+            side_effect=lambda num, email: backups.get(str(num), ("", False))[0],
+        ), patch.object(
+            switcher, "_read_account_credentials_ex",
+            side_effect=lambda num, email: backups.get(str(num), ("", False)),
         ):
-            kind, slot = switcher._classify_outgoing_credential(
-                "1", "account1@example.com", dup,
-                {"resolved": None, "live": dup}, data,
+            return switcher._classify_outgoing_credential(
+                "1", "account1@example.com", self._DUP,
+                {"resolved": None, "live": self._DUP}, data,
             )
-        assert (kind, slot) == ("unresolved", None)
-        # The control: a single owner still classifies foreign-synced.
-        backups["3"] = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-3", "refreshToken": "rt-3",
-        }})
-        with patch.object(
-            switcher, "_read_account_credentials",
-            side_effect=lambda num, email: backups.get(str(num), ""),
-        ):
-            kind, slot = switcher._classify_outgoing_credential(
-                "1", "account1@example.com", dup,
-                {"resolved": None, "live": dup}, data,
-            )
+
+    def test_switch_local_sweep_complete_unique_evidence_is_synced(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher = self._three_slot_switcher(sample_sequence_data)
+        kind, slot = self._classify(switcher, {
+            "1": (self._OWN, False),
+            "2": (self._DUP, False),
+            "3": (self._THIRD, False),
+        })
         assert (kind, slot) == ("foreign-synced", "2")
+
+    def test_switch_local_sweep_duplicate_owners_stash_as_foreign(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Provably-foreign bytes are NEVER written into the outgoing slot —
+        but with two owners, 'already synced, nothing to preserve' is a
+        guess, so they are stashed (foreign), not skipped (foreign-synced)
+        and not fail-open written (unresolved)."""
+        switcher = self._three_slot_switcher(sample_sequence_data)
+        kind, slot = self._classify(switcher, {
+            "1": (self._OWN, False),
+            "2": (self._DUP, False),
+            "3": (self._DUP, False),
+        })
+        assert kind == "foreign"
+        assert slot in ("2", "3")
+
+    def test_switch_local_sweep_unreadable_slot_stashes_as_foreign(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An unreadable slot could own the lineage too: the readable match
+        still proves the bytes are not this slot's (no fail-open write), but
+        the evidence is incomplete, so the live bytes get a safety copy."""
+        switcher = self._three_slot_switcher(sample_sequence_data)
+        kind, slot = self._classify(switcher, {
+            "1": (self._OWN, False),
+            "2": (self._DUP, False),
+            "3": ("", True),
+        })
+        assert (kind, slot) == ("foreign", "2")
+
+    def test_switch_local_sweep_no_owner_stays_unresolved(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """No positive match — rotation-shaped divergence keeps the fail-open
+        (pre-fix backup), unreadable slots or not."""
+        switcher = self._three_slot_switcher(sample_sequence_data)
+        kind, slot = self._classify(switcher, {
+            "1": (self._OWN, False),
+            "2": (self._THIRD, False),
+            "3": ("", True),
+        })
+        assert (kind, slot) == ("unresolved", None)
 
     def test_status_human_path_prints_the_corrected_slot(
         self, temp_home, sample_sequence_data, capsys,
