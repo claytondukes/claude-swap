@@ -7566,6 +7566,53 @@ class TestSelfSwitchProvenance:
         warnings = (result or {}).get("warnings", [])
         assert any("kept in place" in w for w in warnings), warnings
 
+    def test_cleared_config_switch_to_lineage_owner_keeps_live_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A cleared ``oauthAccount`` routes ``switch_to`` through direct
+        activation, which used to restore the target's stored backup over
+        the target's OWN live credential (an unknown-login treatment that
+        moved the access token backward and displaced the live copy into
+        the stash). With the live bytes fingerprint-matching the target's
+        backup — complete evidence, oracle down — the live login must be
+        kept in place and only the config repaired."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        slot2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000}})
+        creds_store[("2", "account2@example.com")] = slot2_backup
+        live_rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-newer-access", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000}})
+        live_state = {"creds": live_rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        switcher._get_claude_config_path().write_text(json.dumps({}))
+        try:
+            with patch("claude_swap.oauth.fetch_oauth_profile",
+                       return_value=None), \
+                 patch.object(switcher, "list_accounts"):
+                switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        live = json.loads(live_state["creds"])
+        assert live["claudeAiOauth"]["accessToken"] == "sk-2-newer-access", (
+            "the target's own live credential must not be displaced by its "
+            "stored backup"
+        )
+        assert creds_store[("2", "account2@example.com")] == slot2_backup
+        assert switcher.list_unclaimed_credentials() == {}, (
+            "nothing was displaced, so nothing may land in the stash"
+        )
+        config = json.loads(switcher._get_claude_config_path().read_text())
+        assert config["oauthAccount"]["emailAddress"] == "account2@example.com"
+        data = json.loads(switcher.sequence_file.read_text())
+        assert data["activeAccountNumber"] == 2
+
     def test_rotation_resolves_by_lineage_with_no_config_identity(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
@@ -7840,18 +7887,20 @@ class TestActiveSlotCrossCheck:
     def test_missing_config_identity_gets_the_no_login_wording(
         self, temp_home, sample_sequence_data,
     ):
-        """configEmail=None means the config records no login — the message
-        must not claim it 'names another identity'."""
+        """A config with no ``oauthAccount`` records no login — the resolver
+        itself must produce the None-identity note end-to-end (not an
+        injected one), and the message must not claim the config 'names
+        another identity'."""
         switcher, patches = self._switcher(
-            temp_home, sample_sequence_data, "someone-else@example.com",
+            temp_home, sample_sequence_data, None,
             backups={"1": self._creds("rt-1"), "2": self._creds("rt-2")},
             live=self._creds("rt-2"),
         )
         with patches[0], patches[1]:
             info = switcher._build_accounts_info()
-        switcher._record_active_mismatch(
-            {"configEmail": None, "configSlot": None, "activeSlot": "2"}
-        )
+        assert switcher._active_mismatch() == {
+            "configEmail": None, "configSlot": None, "activeSlot": "2",
+        }
         msg = switcher._active_mismatch_warning(info)
         assert "records no login" in msg
         assert "another identity" not in msg

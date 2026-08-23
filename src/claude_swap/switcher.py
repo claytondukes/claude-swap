@@ -6974,6 +6974,36 @@ class ClaudeAccountSwitcher:
                             f"Cannot snapshot live config before activation: {e}"
                         )
 
+                # A live login that provably carries the TARGET's own stored
+                # lineage — fingerprint/byte match against COMPLETE backup
+                # evidence — must not be displaced by that backup: with a
+                # cleared or unmanaged config this path otherwise treats the
+                # target's own (possibly newer-generation) live credential
+                # as an unknown login and restores the stored copy over it,
+                # a backward move for zero gain (the fingerprint proves the
+                # refresh lineage identical, so keeping live risks nothing).
+                # Keep the live login; repair config + sequence only.
+                # --force keeps its documented job: rewrite the live login
+                # from the stored backup.
+                keep_live = False
+                if not force_activate and rollback_creds:
+                    live_fp = oauth.credential_fingerprint(rollback_creds)
+                    backup_ev, backup_complete = self._read_backup_evidence(
+                        target_account, target_email
+                    )
+                    keep_live = bool(
+                        backup_ev
+                        and backup_complete
+                        and (
+                            backup_ev == rollback_creds
+                            or (
+                                live_fp
+                                and oauth.credential_fingerprint(backup_ev)
+                                == live_fp
+                            )
+                        )
+                    )
+
                 # Invariant II (issue #117): this path skips the backup step,
                 # so the live credential it replaces would otherwise have no
                 # surviving copy — stash it first. For an unmanaged or
@@ -6981,8 +7011,9 @@ class ClaudeAccountSwitcher:
                 # anywhere; for --force it guards against the "stale" live
                 # login actually being the fresher generation. A failed stash
                 # aborts, except under --force where the user explicitly
-                # asked for the overwrite.
-                if rollback_creds and rollback_creds != target_creds:
+                # asked for the overwrite. (Not displaced under keep_live —
+                # the live bytes stay live; nothing needs preserving.)
+                if not keep_live and rollback_creds and rollback_creds != target_creds:
                     try:
                         self._stash_live_credential(
                             rollback_creds,
@@ -7010,12 +7041,19 @@ class ClaudeAccountSwitcher:
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(
-                        self._prepare_credentials_for_activation(
-                            target_creds, rollback_creds
+                    if keep_live:
+                        self._logger.info(
+                            f"Live credential already carries account "
+                            f"{target_account}'s stored lineage; kept in "
+                            "place (config repair only)"
                         )
-                    )
-                    creds_written = True
+                    else:
+                        self._write_credentials(
+                            self._prepare_credentials_for_activation(
+                                target_creds, rollback_creds
+                            )
+                        )
+                        creds_written = True
 
                     # Mirror the normal switch path: preserve existing local
                     # settings/projects when ~/.claude.json already exists, only
