@@ -5054,7 +5054,9 @@ class ClaudeAccountSwitcher:
             )
             # A reading fetched with a credential that add-token replaced
             # while this pass ran belongs to the old credential: drop it and
-            # leave the row cleared and unclaimed for the next pass.
+            # give back this pass's own lease. add-token already cleared the
+            # row; whatever a newer collector has since put there (its claim,
+            # its reading, its plan) is left alone.
             superseded = self._fetched_with_replaced_credential(
                 records, info_by_num
             )
@@ -5063,8 +5065,8 @@ class ClaudeAccountSwitcher:
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
             if superseded:
-                store.forget_reading(
-                    superseded, {num: identities[num] for num in superseded}
+                store.release_claims(
+                    {num: claims[num] for num in superseded}, identities
                 )
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
@@ -5094,8 +5096,8 @@ class ClaudeAccountSwitcher:
         records: dict[str, FetchRecord],
         info_by_num: dict[str, tuple[int, str, str, str, bool, str, str]],
     ) -> list[str]:
-        """Slots whose stored credential no longer is the one this pass
-        fetched with.
+        """Slots whose stored credential is not, or cannot be shown to be,
+        the one this pass fetched with.
 
         The pass snapshots credentials before it claims, so an ``add-token``
         landing in between hands the collector a fresh claim for a row it
@@ -5115,10 +5117,14 @@ class ClaudeAccountSwitcher:
                 continue
             failed: list = []
             stored = self._read_account_credentials(num, email, failed)
-            if failed or not stored:
-                continue  # unverifiable now; the next add or pass settles it
-            if oauth.credential_fingerprint(stored) != oauth.credential_fingerprint(
-                creds
+            # Unreadable or gone counts as replaced: a result that cannot be
+            # tied to the stored credential is not recorded, and the next
+            # pass fetches again.
+            if (
+                failed
+                or not stored
+                or oauth.credential_fingerprint(stored)
+                != oauth.credential_fingerprint(creds)
             ):
                 replaced.append(num)
         return replaced

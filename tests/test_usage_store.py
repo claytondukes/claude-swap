@@ -1304,6 +1304,19 @@ class TestDeadTokenQuarantine:
         store.forget_reading(["1"], IDENT)
         assert store.entries(IDENT)["2"].last_good == USAGE
 
+    def test_release_claims_gives_back_only_the_callers_lease(self, store):
+        mine = store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.release_claims(mine, IDENT) == {"1"}
+        # Free again: another collector can claim it at once.
+        theirs = store.reserve(["1"], IDENT, respect_plans=True)
+        assert "1" in theirs
+        # A stale lease id touches nothing of the newer collector's.
+        assert store.release_claims(mine, IDENT) == set()
+        assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims=theirs) == {"1"}
+        assert store.entries(IDENT)["1"].last_good == USAGE
+        assert store.release_claims(mine, IDENT) == set()
+        assert store.entries(IDENT)["1"].last_good == USAGE
+
     def test_request_refresh_beats_ttl_and_plan_once(self, store, clock):
         store.record(
             {"1": FetchRecord(usage=USAGE)}, IDENT,

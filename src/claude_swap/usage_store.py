@@ -1211,6 +1211,34 @@ class UsageStore:
         self._mutate(identities, nums, apply)
 
 
+    def release_claims(
+        self, claims: dict[str, str], identities: dict[str, Identity]
+    ) -> set[str]:
+        """Give back leases this collector holds without recording anything.
+
+        For a collector that decides its own result must not be stored. Only
+        a row that still carries the caller's lease id and identity is
+        touched, so a newer collector's claim, reading or plan is never
+        disturbed. Returns the slots released.
+        """
+        released: set[str] = set()
+        if not claims:
+            return released
+        with self._lock():
+            rows = self._read_rows()
+            for num, claim_id in claims.items():
+                row = rows.get(num)
+                if (
+                    self._matches(row, identities[num])
+                    and row.get("claimId") == claim_id
+                ):
+                    row["claimId"] = None
+                    row["claimUntil"] = 0.0
+                    released.add(num)
+            if released:
+                self._write_rows(rows)
+        return released
+
     def request_refresh(
         self, nums: Iterable[str], identities: dict[str, Identity]
     ) -> set[str]:
