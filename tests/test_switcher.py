@@ -4932,6 +4932,87 @@ class TestAddAccountFromToken:
 
         assert store.entries(ident)["3"].last_good is None
 
+    def test_remove_prunes_the_usage_row(self, temp_home):
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-a", "a@example.com")
+        switcher.add_account_from_token("sk-ant-oat01-b", "b@example.com")
+        store, _ = self._seed_reading(switcher, "1", "a@example.com")
+        self._seed_reading(switcher, "2", "b@example.com")
+
+        switcher.remove_account("1", assume_yes=True)
+
+        assert set(store._read_rows()) == {"2"}
+
+    def test_list_refresh_fetches_despite_a_fresh_reading(self, temp_home):
+        """--refresh makes the collector fetch a slot its plan would skip."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-a", "a@example.com")
+        self._seed_reading(switcher, "1", "a@example.com")
+        fetched = []
+
+        def fake_fetches(infos):
+            from claude_swap.usage_store import FetchRecord
+
+            fetched.extend(str(info[0]) for info in infos)
+            return {
+                str(info[0]): FetchRecord(usage={"seven_day": {"pct": 41.0}})
+                for info in infos
+            }
+
+        with patch.object(switcher, "_run_usage_fetches", side_effect=fake_fetches):
+            switcher.list_accounts(json_output=True)
+            assert fetched == []
+            payload = switcher.list_accounts(json_output=True, refresh="1")
+
+        assert fetched == ["1"]
+        assert payload["accounts"][0]["usage"]["sevenDay"]["pct"] == 41.0
+
+    def test_unreadable_old_credential_still_forgets_the_reading(self, temp_home):
+        """A failed read of the stored credential is treated as a change."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store, ident = self._seed_reading(switcher, "1", "user@example.com")
+
+        def failing_read(num, email, failed=None):
+            if failed is not None:
+                failed.append("read error")
+            return ""
+
+        with patch.object(
+            switcher, "_read_account_credentials", side_effect=failing_read
+        ):
+            switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+
+        assert store.entries(ident)["1"].last_good is None
+
+    def test_reading_fetched_with_a_replaced_token_is_dropped(self, temp_home):
+        """A pass that snapshotted the old token, then fetched after add-token
+        replaced it, must not record the old token's reading."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store = switcher._usage_store
+        ident = {"1": ("user@example.com", "")}
+
+        def replace_then_answer(infos):
+            # The replacement lands after the snapshot and the claim.
+            switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+            return {
+                str(info[0]): FetchRecord(usage={"seven_day": {"pct": 52.0}})
+                for info in infos
+            }
+
+        with patch.object(
+            switcher, "_run_usage_fetches", side_effect=replace_then_answer
+        ):
+            switcher.list_accounts(json_output=True)
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good is None
+        # Unclaimed and unplanned: the next pass fetches with the new token.
+        assert "1" in store.reserve(["1"], ident, respect_plans=True)
+
     def test_re_adding_the_same_token_keeps_its_reading(self, temp_home):
         """The reading still belongs to the credential: nothing to forget."""
         switcher = self._make_switcher(temp_home)

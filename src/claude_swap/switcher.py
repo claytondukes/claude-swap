@@ -3755,6 +3755,8 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        # A displaced or migrated-from slot leaves its usage row behind.
+        self._usage_store.prune(data["accounts"].keys())
         source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
@@ -3770,8 +3772,14 @@ class ClaudeAccountSwitcher:
         """True when the slot already stores a credential other than
         ``credentials``. False for an empty slot (nothing was replaced) and
         for a re-add of the same token or key (its reading is still its own).
+        A stored credential that could not be read counts as different: the
+        reading cannot be shown to belong to the new one, and a needless
+        refetch is cheaper than serving another credential's numbers.
         """
-        stored = self._read_account_credentials(account_num, email)
+        failed: list = []
+        stored = self._read_account_credentials(account_num, email, failed)
+        if failed:
+            return True
         if not stored:
             return False
         return oauth.credential_fingerprint(stored) != oauth.credential_fingerprint(
@@ -3861,6 +3869,7 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        self._usage_store.prune(data["accounts"].keys())
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
@@ -5043,8 +5052,20 @@ class ClaudeAccountSwitcher:
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims]
             )
+            # A reading fetched with a credential that add-token replaced
+            # while this pass ran belongs to the old credential: drop it and
+            # leave the row cleared and unclaimed for the next pass.
+            superseded = self._fetched_with_replaced_credential(
+                records, info_by_num
+            )
+            for num in superseded:
+                del records[num]
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
+            if superseded:
+                store.forget_reading(
+                    superseded, {num: identities[num] for num in superseded}
+                )
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
             }
@@ -5067,6 +5088,40 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _fetched_with_replaced_credential(
+        self,
+        records: dict[str, FetchRecord],
+        info_by_num: dict[str, tuple[int, str, str, str, bool, str, str]],
+    ) -> list[str]:
+        """Slots whose stored credential no longer is the one this pass
+        fetched with.
+
+        The pass snapshots credentials before it claims, so an ``add-token``
+        landing in between hands the collector a fresh claim for a row it
+        then fills from the OLD token. Only non-refreshable credentials
+        (setup-tokens, API keys) are checked: their bytes change only by
+        replacement. A refreshable login rotates its tokens routinely and its
+        identity is verified by lineage elsewhere. The active slot's
+        credential is the live store's, which ``add-token`` never writes.
+        """
+        replaced: list[str] = []
+        for num in records:
+            _n, email, _org, _org_uuid, is_active, creds, _alias = info_by_num[num]
+            if is_active or not creds:
+                continue
+            snapshot = oauth.extract_oauth_data(creds)
+            if snapshot and snapshot.get("refreshToken"):
+                continue
+            failed: list = []
+            stored = self._read_account_credentials(num, email, failed)
+            if failed or not stored:
+                continue  # unverifiable now; the next add or pass settles it
+            if oauth.credential_fingerprint(stored) != oauth.credential_fingerprint(
+                creds
+            ):
+                replaced.append(num)
+        return replaced
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
@@ -5504,8 +5559,13 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        refresh: str | None = None,
     ) -> dict | None:
         """List all managed accounts.
+
+        ``refresh`` (``NUM|EMAIL|ALIAS``) asks for one fresh fetch of that
+        account in this pass, ignoring the serve TTL and its poll plan; see
+        :meth:`UsageStore.request_refresh` for what it will not override.
 
         In ``json_output`` mode, returns the schema-v1 payload (printing nothing)
         for the CLI to serialize; otherwise prints the human view and returns None.
@@ -5526,6 +5586,16 @@ class ClaudeAccountSwitcher:
             print(dimmed("No accounts are managed yet."))
             self._first_run_setup()
             return None
+
+        if refresh is not None:
+            num, email, org_uuid = self.resolve_account(refresh)
+            if not self._usage_store.request_refresh([num], {num: (email, org_uuid)}):
+                # stderr: stdout is the JSON payload in --json mode.
+                print(
+                    f"Account-{num} ({email}) was not refreshed: it is in "
+                    "backoff, needs a re-login, or is being fetched right now.",
+                    file=sys.stderr,
+                )
 
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)

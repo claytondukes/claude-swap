@@ -1066,6 +1066,9 @@ class UsageStore:
             rec = outcomes[num]
             row["claimId"] = None
             row["claimUntil"] = 0.0
+            # A requested refresh buys exactly one attempt, whatever it
+            # returned: a failure falls back to the normal plan and backoff.
+            row.pop("refreshRequested", None)
             if rec.sentinel is not None:
                 return
             row["lastAttemptAt"] = now
@@ -1208,8 +1211,68 @@ class UsageStore:
         self._mutate(identities, nums, apply)
 
 
+    def request_refresh(
+        self, nums: Iterable[str], identities: dict[str, Identity]
+    ) -> set[str]:
+        """Arm one fetch that ignores the serve TTL and the poll plan.
+
+        For the caller who knows a reading is wrong or wants it now
+        (``cswap list --refresh``). The cached reading stays in place until
+        the fetch answers (stale-on-error still applies). Returns the slots
+        that were armed: a slot in failure/429 backoff, quarantined for a dead
+        token, or already being fetched by another collector is NOT armed, so
+        a refresh can never spend a request the budget rules forbid. Each
+        armed slot costs one request against the per-token budget described
+        in ``poll_policy``.
+        """
+        armed: set[str] = set()
+        now = self.clock()
+
+        def apply(num: str, row: dict) -> None:
+            if _row_blocked(row, now):
+                return
+            row["refreshRequested"] = True
+            armed.add(num)
+
+        self._mutate(identities, list(nums), apply)
+        return armed
+
+    def prune(self, keep: Iterable[str]) -> int:
+        """Drop rows whose slot number is not in ``keep``; returns how many.
+
+        A removed, moved or displaced slot leaves its row behind. Nothing
+        reads an orphan (rows are looked up by slot number), but it keeps a
+        stale reading and plan on disk indefinitely.
+        """
+        keep = set(keep)
+        with self._lock():
+            rows = self._read_rows()
+            orphans = [num for num in rows if num not in keep]
+            if not orphans:
+                return 0
+            for num in orphans:
+                del rows[num]
+            self._write_rows(rows)
+        return len(orphans)
+
+
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _row_blocked(row: dict, now: float) -> bool:
+    """The gates no caller may bypass: a dead token, a failure/429 backoff,
+    or another collector's live claim."""
+    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+        return True
+    backoff_until = _num_or_none(row.get("backoffUntil"))
+    if backoff_until is not None and now < backoff_until:
+        return True
+    return _live_claim(
+        _num_or_none(row.get("claimUntil")),
+        _num_or_none(row.get("lastAttemptAt")),
+        now,
+    )
 
 
 def _row_eligible(
@@ -1217,17 +1280,10 @@ def _row_eligible(
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    if _row_blocked(row, now):
         return False
-    backoff_until = _num_or_none(row.get("backoffUntil"))
-    if backoff_until is not None and now < backoff_until:
-        return False
-    if _live_claim(
-        _num_or_none(row.get("claimUntil")),
-        _num_or_none(row.get("lastAttemptAt")),
-        now,
-    ):
-        return False
+    if row.get("refreshRequested"):
+        return True  # one requested fetch beats the serve TTL and the plan
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))

@@ -1003,6 +1003,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
   %(prog)s list --token-status
+  %(prog)s list --refresh 3               # one fresh usage fetch for account 3
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
@@ -1029,6 +1030,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--token-status",
         action="store_true",
         help="Show source-labelled OAuth token diagnostics (use with 'list')",
+    )
+    parser.add_argument(
+        "--refresh",
+        metavar="NUM|EMAIL",
+        help=(
+            "With 'list': fetch this account's usage now, once, ignoring the "
+            "cache and its poll schedule. Costs one usage request; skipped "
+            "while the account is in backoff"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -1218,6 +1228,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
+    if args.refresh is not None and not args.list:
+        parser.error("--refresh can only be used with 'list'")
+
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
 
@@ -1300,6 +1313,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,
+                refresh=args.refresh,
             )
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
