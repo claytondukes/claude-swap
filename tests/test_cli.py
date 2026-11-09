@@ -147,6 +147,28 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--token-status can only be used with 'list'" in capsys.readouterr().err
 
+    def test_refresh_flag_is_forwarded_to_list(self):
+        """list --refresh 3 should call list_accounts(refresh="3")."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "list", "--refresh", "3"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            show_token_status=False,
+            json_output=False,
+            refresh="3",
+        )
+
+    def test_refresh_without_list_is_rejected(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "status", "--refresh", "3"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--refresh can only be used with 'list'" in capsys.readouterr().err
+
     def test_token_status_flag_is_forwarded_to_list(self):
         """--list --token-status should call list_accounts(show_token_status=True)."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -158,6 +180,7 @@ class TestCLI:
         switcher_cls.return_value.list_accounts.assert_called_once_with(
             show_token_status=True,
             json_output=False,
+            refresh=None,
         )
 
     def test_strategy_best_requires_switch(self, capsys):
@@ -750,7 +773,7 @@ class TestSubcommandAliases:
             switcher_cls.return_value.list_accounts.return_value = payload
             cli.main()
         switcher_cls.return_value.list_accounts.assert_called_once_with(
-            show_token_status=False, json_output=True,
+            show_token_status=False, json_output=True, refresh=None,
         )
 
     def test_run_subcommand_still_dispatches(self):
@@ -813,7 +836,7 @@ class TestJsonOutputCli:
             cli.main()
 
         switcher_cls.return_value.list_accounts.assert_called_once_with(
-            show_token_status=False, json_output=True,
+            show_token_status=False, json_output=True, refresh=None,
         )
         out = capsys.readouterr().out
         assert json.loads(out) == payload  # exactly one JSON object, no extra text

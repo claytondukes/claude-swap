@@ -4895,6 +4895,202 @@ class TestAddAccountFromToken:
         switcher._init_sequence_file()
         return switcher
 
+    def _seed_reading(self, switcher, num, email):
+        """Give a slot a cached reading under a plan that is not yet due."""
+        from claude_swap.usage_store import FetchRecord
+
+        store = switcher._usage_store
+        ident = {num: (email, "")}
+        store.record(
+            {num: FetchRecord(usage={"seven_day": {"pct": 52.0}})}, ident,
+            plans={num: (store.clock() + 450, 450.0)},
+        )
+        return store, ident
+
+    def test_replacing_a_token_forgets_the_old_reading(self, temp_home):
+        """A different token for the same email (same identity) must not keep
+        serving the reading the old token produced."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store, ident = self._seed_reading(switcher, "1", "user@example.com")
+
+        switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good is None
+        assert entry.next_poll_at is None
+
+    def test_replacing_a_token_by_slot_forgets_the_old_reading(self, temp_home):
+        """The --slot path (same email, same slot) clears the reading too."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com", slot=3)
+        store, ident = self._seed_reading(switcher, "3", "user@example.com")
+
+        switcher.add_account_from_token(
+            "sk-ant-oat01-new", "user@example.com", slot=3, assume_yes=True
+        )
+
+        assert store.entries(ident)["3"].last_good is None
+
+    def test_remove_prunes_the_usage_row(self, temp_home):
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-a", "a@example.com")
+        switcher.add_account_from_token("sk-ant-oat01-b", "b@example.com")
+        store, _ = self._seed_reading(switcher, "1", "a@example.com")
+        self._seed_reading(switcher, "2", "b@example.com")
+
+        switcher.remove_account("1", assume_yes=True)
+
+        assert set(store._read_rows()) == {"2"}
+
+    def test_list_refresh_fetches_despite_a_fresh_reading(self, temp_home):
+        """--refresh makes the collector fetch a slot its plan would skip."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-a", "a@example.com")
+        self._seed_reading(switcher, "1", "a@example.com")
+        fetched = []
+
+        def fake_fetches(infos):
+            from claude_swap.usage_store import FetchRecord
+
+            fetched.extend(str(info[0]) for info in infos)
+            return {
+                str(info[0]): FetchRecord(usage={"seven_day": {"pct": 41.0}})
+                for info in infos
+            }
+
+        with patch.object(switcher, "_run_usage_fetches", side_effect=fake_fetches):
+            switcher.list_accounts(json_output=True)
+            assert fetched == []
+            payload = switcher.list_accounts(json_output=True, refresh="1")
+
+        assert fetched == ["1"]
+        assert payload["accounts"][0]["usage"]["sevenDay"]["pct"] == 41.0
+
+    def test_unreadable_old_credential_still_forgets_the_reading(self, temp_home):
+        """A failed read of the stored credential is treated as a change."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store, ident = self._seed_reading(switcher, "1", "user@example.com")
+
+        def failing_read(num, email, failed=None):
+            if failed is not None:
+                failed.append("read error")
+            return ""
+
+        with patch.object(
+            switcher, "_read_account_credentials", side_effect=failing_read
+        ):
+            switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+
+        assert store.entries(ident)["1"].last_good is None
+
+    def test_reading_fetched_with_a_replaced_token_is_dropped(self, temp_home):
+        """A pass that snapshotted the old token, then fetched after add-token
+        replaced it, must not record the old token's reading."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store = switcher._usage_store
+        ident = {"1": ("user@example.com", "")}
+
+        def replace_then_answer(infos):
+            # The replacement lands after the snapshot and the claim.
+            switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+            return {
+                str(info[0]): FetchRecord(usage={"seven_day": {"pct": 52.0}})
+                for info in infos
+            }
+
+        with patch.object(
+            switcher, "_run_usage_fetches", side_effect=replace_then_answer
+        ):
+            switcher.list_accounts(json_output=True)
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good is None
+        # Unclaimed and unplanned: the next pass fetches with the new token.
+        assert "1" in store.reserve(["1"], ident, respect_plans=True)
+
+    def test_result_is_dropped_when_the_stored_token_cannot_be_reread(self, temp_home):
+        """An unverifiable result is not recorded, and nothing is planned."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store = switcher._usage_store
+        ident = {"1": ("user@example.com", "")}
+        real_read = switcher._read_account_credentials
+        state = {"fetching": False}
+
+        def read(num, email, failed=None):
+            if state["fetching"]:
+                if failed is not None:
+                    failed.append("read error")
+                return ""
+            return real_read(num, email, failed)
+
+        def answer(infos):
+            state["fetching"] = True
+            return {
+                str(info[0]): FetchRecord(usage={"seven_day": {"pct": 52.0}})
+                for info in infos
+            }
+
+        with patch.object(switcher, "_read_account_credentials", side_effect=read), \
+             patch.object(switcher, "_run_usage_fetches", side_effect=answer):
+            switcher.list_accounts(json_output=True)
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good is None
+        assert entry.next_poll_at is None
+        assert "1" in store.reserve(["1"], ident, respect_plans=True)
+
+    def test_dropped_result_leaves_a_newer_collectors_reading_alone(self, temp_home):
+        """Collector A's cleanup must not erase what collector B recorded with
+        the replacement token while A's fetch was in flight."""
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store = switcher._usage_store
+        ident = {"1": ("user@example.com", "")}
+        newer = {"seven_day": {"pct": 41.0}}
+
+        def replace_and_let_b_finish(infos):
+            switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+            b_claims = store.reserve(["1"], ident, respect_plans=True)
+            store.record(
+                {"1": FetchRecord(usage=newer)}, ident, claims=b_claims,
+                plans={"1": (store.clock() + 450, 450.0)},
+            )
+            return {
+                str(info[0]): FetchRecord(usage={"seven_day": {"pct": 52.0}})
+                for info in infos
+            }
+
+        with patch.object(
+            switcher, "_run_usage_fetches", side_effect=replace_and_let_b_finish
+        ):
+            switcher.list_accounts(json_output=True)
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good == newer
+        assert entry.next_poll_at is not None
+
+    def test_re_adding_the_same_token_keeps_its_reading(self, temp_home):
+        """The reading still belongs to the credential: nothing to forget."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-same", "user@example.com")
+        store, ident = self._seed_reading(switcher, "1", "user@example.com")
+
+        switcher.add_account_from_token("sk-ant-oat01-same", "user@example.com")
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good == {"seven_day": {"pct": 52.0}}
+        assert entry.next_poll_at is not None
+
     def test_basic_add_stores_account(self, temp_home, capsys):
         """A valid token + email should store the account and print 'Added'."""
         switcher = self._make_switcher(temp_home)

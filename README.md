@@ -289,6 +289,7 @@ Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable 
 
 ```bash
 cswap list --json                   # all accounts with usage/quota
+cswap list --refresh 3              # fetch account 3's usage now, once (skips the cache and schedule)
 cswap status --json                 # current active account
 cswap switch --strategy best --json # switch, then report the result
 cswap switch 2 --json

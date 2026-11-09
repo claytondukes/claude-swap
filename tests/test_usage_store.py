@@ -1269,6 +1269,112 @@ class TestDeadTokenQuarantine:
         # A dead token is never nominated as the alternate to poll.
         assert due_candidate(["1"], entries, clock.now) is None
 
+    def test_forget_reading_drops_reading_and_plan(self, store, clock):
+        """A replaced credential's reading and schedule go; the slot is
+        fetch-eligible at once instead of when the old plan comes due."""
+        store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT,
+            plans={"1": (clock.now + 450, 450.0)},
+        )
+        # Fresh reading under a future plan: nobody may fetch it yet.
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+        store.forget_reading(["1"], IDENT)
+
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good is None
+        assert entry.fetched_at is None
+        assert entry.next_poll_at is None
+        assert entry.poll_interval_s is None
+        assert "1" in store.reserve(["1"], IDENT, respect_plans=True)
+
+    def test_forget_reading_fences_an_in_flight_fetch(self, store):
+        """A fetch claimed with the old credential cannot record its reading
+        over the cleared row."""
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.forget_reading(["1"], IDENT)
+        accepted = store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims=claims)
+        assert accepted == set()
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_forget_reading_leaves_other_slots_alone(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+        store.forget_reading(["1"], IDENT)
+        assert store.entries(IDENT)["2"].last_good == USAGE
+
+    def test_release_claims_gives_back_only_the_callers_lease(self, store):
+        mine = store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.release_claims(mine, IDENT) == {"1"}
+        # Free again: another collector can claim it at once.
+        theirs = store.reserve(["1"], IDENT, respect_plans=True)
+        assert "1" in theirs
+        # A stale lease id touches nothing of the newer collector's.
+        assert store.release_claims(mine, IDENT) == set()
+        assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims=theirs) == {"1"}
+        assert store.entries(IDENT)["1"].last_good == USAGE
+        assert store.release_claims(mine, IDENT) == set()
+        assert store.entries(IDENT)["1"].last_good == USAGE
+
+    def test_request_refresh_beats_ttl_and_plan_once(self, store, clock):
+        store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT,
+            plans={"1": (clock.now + 450, 450.0)},
+        )
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+        assert store.request_refresh(["1"], IDENT) == {"1"}
+        # The reading is still served while the fetch is pending.
+        assert store.entries(IDENT)["1"].last_good == USAGE
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert "1" in claims
+
+        store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, claims=claims,
+            plans={"1": (clock.now + 450, 450.0)},
+        )
+        # One attempt only: the plan governs again.
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+    def test_request_refresh_is_spent_by_a_failed_attempt(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.request_refresh(["1"], IDENT)
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT, claims=claims)
+        clock.advance(10_000)  # past the failure backoff
+        store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT,
+            plans={"1": (clock.now + 450, 450.0)},
+        )
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+    def test_request_refresh_does_not_arm_a_slot_in_backoff(self, store):
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=600)}, IDENT)
+        assert store.request_refresh(["1"], IDENT) == set()
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+    def test_request_refresh_does_not_arm_a_dead_token(self, store, clock):
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        clock.advance(10_000)
+        assert store.entries(IDENT)["1"].token_dead()
+        assert store.request_refresh(["1"], IDENT) == set()
+
+    def test_request_refresh_does_not_arm_a_slot_being_fetched(self, store):
+        assert "1" in store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.request_refresh(["1"], IDENT) == set()
+
+    def test_prune_drops_rows_for_slots_that_no_longer_exist(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+        assert store.prune(["2"]) == 1
+        entries = store.entries(IDENT)
+        assert entries["1"].last_good is None
+        assert entries["2"].last_good == USAGE
+        assert store.prune(["2"]) == 0
+
     def test_clear_dead_token_lifts_quarantine(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
