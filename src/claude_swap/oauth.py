@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -374,6 +375,160 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+# --- Setup-token usage: read the quota from inference response headers -------
+#
+# A `claude setup-token` credential is inference-only: /api/oauth/usage answers
+# it with 403 (measured 2026-11-09), so the usage endpoint can never report
+# such an account. Every /v1/messages response does carry the same windows as
+# `anthropic-ratelimit-unified-<window>-{utilization,reset,status}` headers, so
+# a one-output-token request reads them instead. Measured against the usage
+# endpoint's last reading for the same account: 5h 0.0 vs 0%, 7d 0.47 vs 47%,
+# and the extra `7d_oi` window 0.89 vs the "Fable" scoped limit's 90%.
+#
+# The per-model weekly window is only reported on a request to that model (a
+# Haiku request returned 5h and 7d alone), which is why the probe targets the
+# model whose weekly limit matters. The header names the window, not the
+# model, so the scoped entry is labelled from the probe model's family
+# ("claude-fable-5-2" -> "Fable") to match the usage endpoint's display name.
+#
+# Unlike the usage endpoint, a probe is a real request: ~35 input tokens and
+# one output token against the account's own quota per poll.
+MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+USAGE_PROBE_MODEL_ENV = "CSWAP_USAGE_PROBE_MODEL"
+DEFAULT_USAGE_PROBE_MODEL = "claude-fable-5-2"
+# The messages endpoint rejects an OAuth token whose request lacks this system
+# prompt (429 "Error" with no ratelimit headers, measured 2026-11-09).
+_PROBE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
+_RATELIMIT_HEADER_PREFIX = "anthropic-ratelimit-unified-"
+_UTILIZATION_SUFFIX = "-utilization"
+# Windows that are not usage percentages of a rate-limit window: "overage" is
+# the extra-usage spend allowance, which the headers report without the
+# used/limit amounts the spend row needs.
+_NON_WINDOW_KEYS = frozenset({"overage"})
+
+
+def is_setup_token(oauth: dict | None) -> bool:
+    """True for a `claude setup-token` credential as ``add-token`` stores it:
+    an access token with no refresh token and the inference-only scope."""
+    if not isinstance(oauth, dict) or oauth.get("refreshToken"):
+        return False
+    return list(oauth.get("scopes") or []) == ["user:inference"]
+
+
+def usage_probe_model() -> str:
+    """Model the header probe targets (``CSWAP_USAGE_PROBE_MODEL`` overrides)."""
+    return os.environ.get(USAGE_PROBE_MODEL_ENV, "").strip() or DEFAULT_USAGE_PROBE_MODEL
+
+
+def _probe_model_display_name(model: str) -> str:
+    """``claude-fable-5-2`` -> ``Fable``; an unrecognized id is used verbatim."""
+    parts = model.split("-")
+    if len(parts) >= 2 and parts[0] == "claude" and parts[1].isalpha():
+        return parts[1].capitalize()
+    return model
+
+
+def _epoch_to_iso(raw: str | None) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(float(raw)), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def usage_data_from_ratelimit_headers(headers, model: str) -> dict:
+    """Translate unified rate-limit headers into the usage API's raw shape.
+
+    Returns the dict :func:`build_usage_result` already understands
+    (``five_hour``/``seven_day`` plus a ``limits`` entry per extra weekly
+    window), or ``{}`` when the response carried no utilization headers.
+    """
+    windows: dict[str, dict] = {}
+    for name, value in headers.items():
+        lowered = name.lower()
+        if not (
+            lowered.startswith(_RATELIMIT_HEADER_PREFIX)
+            and lowered.endswith(_UTILIZATION_SUFFIX)
+        ):
+            continue
+        key = lowered[len(_RATELIMIT_HEADER_PREFIX):-len(_UTILIZATION_SUFFIX)]
+        if not key or key in _NON_WINDOW_KEYS:
+            continue
+        try:
+            pct = round(float(value) * 100, 2)
+        except (TypeError, ValueError):
+            continue
+        entry: dict = {"utilization": pct}
+        resets_at = _epoch_to_iso(headers.get(f"{_RATELIMIT_HEADER_PREFIX}{key}-reset"))
+        if resets_at:
+            entry["resets_at"] = resets_at
+        windows[key] = entry
+
+    data: dict = {}
+    if "5h" in windows:
+        data["five_hour"] = windows.pop("5h")
+    if "7d" in windows:
+        data["seven_day"] = windows.pop("7d")
+    display = _probe_model_display_name(model)
+    limits = []
+    for index, key in enumerate(sorted(windows)):
+        entry = windows[key]
+        limit: dict = {
+            # A second extra window has no known meaning yet: keep it visible
+            # under its raw key rather than guess or drop it.
+            "scope": {"model": {"display_name": display if index == 0 else f"{display} ({key})"}},
+            "percent": entry["utilization"],
+        }
+        if entry.get("resets_at"):
+            limit["resets_at"] = entry["resets_at"]
+        limits.append(limit)
+    if limits:
+        data["limits"] = limits
+    return data
+
+
+def request_usage_data_via_probe(access_token: str) -> dict:
+    """Read an inference-only token's usage from a one-token request's headers.
+
+    An account that is already rate limited answers 429 with the same
+    headers, and that reading is the one that matters most, so it is returned
+    as usage rather than raised. Any other failure, or a 429 without
+    utilization headers, propagates like a usage-endpoint error.
+    """
+    model = usage_probe_model()
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "system": _PROBE_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(MESSAGES_URL, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+            return usage_data_from_ratelimit_headers(resp.headers, model)
+    except urllib.error.HTTPError as e:
+        if e.code == 429 and e.headers:
+            data = usage_data_from_ratelimit_headers(e.headers, model)
+            if data:
+                return data
+        raise
+
+
+def _request_usage_for(oauth: dict | None, access_token: str) -> dict:
+    """Usage data by the path the credential can use: the header probe for an
+    inference-only setup-token, the usage endpoint for everything else."""
+    if is_setup_token(oauth):
+        return request_usage_data_via_probe(access_token)
+    return request_usage_data(access_token)
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
@@ -670,7 +825,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        data = _request_usage_for(oauth, access_token)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)

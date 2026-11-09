@@ -1497,3 +1497,242 @@ class TestConsumeBusyIsDeterministic:
             k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
         ]
         assert not missing, missing
+
+
+def _setup_token_creds(token: str = "sk-ant-oat01-test") -> str:
+    """A setup-token credential exactly as ``add-token`` stores it."""
+    return json.dumps(
+        {"claudeAiOauth": {"accessToken": token, "scopes": ["user:inference"]}}
+    )
+
+
+def _probe_response(headers: dict) -> MagicMock:
+    response = MagicMock()
+    response.read.return_value = b"{}"
+    response.headers = headers
+    response.__enter__ = lambda s: s
+    response.__exit__ = MagicMock(return_value=False)
+    return response
+
+
+# Header set captured from a real one-token request (values as sent).
+_PROBE_HEADERS = {
+    "anthropic-ratelimit-unified-5h-utilization": "0.0",
+    "anthropic-ratelimit-unified-5h-reset": "1794277800",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.47",
+    "anthropic-ratelimit-unified-7d-reset": "1794351600",
+    "anthropic-ratelimit-unified-7d_oi-utilization": "0.89",
+    "anthropic-ratelimit-unified-7d_oi-reset": "1794351600",
+    "anthropic-ratelimit-unified-7d_oi-surpassed-threshold": "0.75",
+    "anthropic-ratelimit-unified-overage-utilization": "0.0",
+    "anthropic-ratelimit-unified-overage-reset": "1796083200",
+    "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+    "anthropic-ratelimit-unified-reset": "1794351600",
+}
+
+
+class TestIsSetupToken:
+    """Test is_setup_token."""
+
+    def test_add_token_shape_is_a_setup_token(self):
+        assert oauth.is_setup_token(
+            {"accessToken": "t", "scopes": ["user:inference"]}
+        )
+
+    def test_refreshable_login_is_not(self):
+        assert not oauth.is_setup_token(
+            {"accessToken": "t", "refreshToken": "r", "scopes": ["user:inference"]}
+        )
+
+    def test_wider_scopes_are_not(self):
+        assert not oauth.is_setup_token(
+            {"accessToken": "t", "scopes": ["user:inference", "user:profile"]}
+        )
+
+    def test_missing_scopes_and_non_dict_are_not(self):
+        assert not oauth.is_setup_token({"accessToken": "t"})
+        assert not oauth.is_setup_token(None)
+
+
+class TestUsageDataFromRatelimitHeaders:
+    """Test usage_data_from_ratelimit_headers."""
+
+    def test_windows_map_to_usage_api_shape(self):
+        data = oauth.usage_data_from_ratelimit_headers(
+            _PROBE_HEADERS, "claude-fable-5-2"
+        )
+        assert data["five_hour"] == {
+            "utilization": 0.0,
+            "resets_at": "2026-11-10T02:30:00+00:00",
+        }
+        assert data["seven_day"] == {
+            "utilization": 47.0,
+            "resets_at": "2026-11-10T23:00:00+00:00",
+        }
+        assert data["limits"] == [
+            {
+                "scope": {"model": {"display_name": "Fable"}},
+                "percent": 89.0,
+                "resets_at": "2026-11-10T23:00:00+00:00",
+            }
+        ]
+
+    def test_overage_is_not_reported_as_a_window(self):
+        data = oauth.usage_data_from_ratelimit_headers(
+            _PROBE_HEADERS, "claude-fable-5-2"
+        )
+        assert len(data["limits"]) == 1
+
+    def test_header_names_match_case_insensitively(self):
+        data = oauth.usage_data_from_ratelimit_headers(
+            {"Anthropic-Ratelimit-Unified-5h-Utilization": "0.25"}, "claude-fable-5-2"
+        )
+        assert data == {"five_hour": {"utilization": 25.0}}
+
+    def test_no_per_model_window_yields_no_limits(self):
+        headers = {
+            k: v for k, v in _PROBE_HEADERS.items() if "7d_oi" not in k
+        }
+        data = oauth.usage_data_from_ratelimit_headers(headers, "claude-haiku-4-5")
+        assert "limits" not in data
+        assert set(data) == {"five_hour", "seven_day"}
+
+    def test_no_utilization_headers_is_empty(self):
+        assert oauth.usage_data_from_ratelimit_headers(
+            {"content-type": "application/json"}, "claude-fable-5-2"
+        ) == {}
+
+    def test_malformed_values_are_skipped(self):
+        data = oauth.usage_data_from_ratelimit_headers(
+            {
+                "anthropic-ratelimit-unified-5h-utilization": "n/a",
+                "anthropic-ratelimit-unified-7d-utilization": "0.5",
+                "anthropic-ratelimit-unified-7d-reset": "soon",
+            },
+            "claude-fable-5-2",
+        )
+        assert data == {"seven_day": {"utilization": 50.0}}
+
+    def test_unrecognized_model_id_labels_the_window_verbatim(self):
+        data = oauth.usage_data_from_ratelimit_headers(
+            {"anthropic-ratelimit-unified-7d_oi-utilization": "0.1"}, "custom"
+        )
+        assert data["limits"][0]["scope"]["model"]["display_name"] == "custom"
+
+
+class TestSetupTokenUsageProbe:
+    """Setup-token accounts read usage from inference response headers."""
+
+    def test_setup_token_probes_messages_not_the_usage_endpoint(self):
+        seen = []
+
+        def mock_urlopen(req, timeout=0):
+            seen.append(req)
+            return _probe_response(_PROBE_HEADERS)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen), \
+             patch("claude_swap.oauth.format_reset", return_value=("1h", "12:00")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@example.com", _setup_token_creds(), is_active=False
+            )
+
+        assert len(seen) == 1
+        req = seen[0]
+        assert req.full_url == oauth.MESSAGES_URL
+        body = json.loads(req.data)
+        assert body["model"] == oauth.DEFAULT_USAGE_PROBE_MODEL
+        assert body["max_tokens"] == 1
+        assert req.get_header("Authorization") == "Bearer sk-ant-oat01-test"
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 0.0
+        assert outcome.usage["seven_day"]["pct"] == 47.0
+        assert outcome.usage["scoped"][0]["name"] == "Fable"
+        assert outcome.usage["scoped"][0]["pct"] == 89.0
+
+    def test_probe_model_env_override(self, monkeypatch):
+        monkeypatch.setenv(oauth.USAGE_PROBE_MODEL_ENV, "claude-opus-5-5")
+        seen = []
+
+        def mock_urlopen(req, timeout=0):
+            seen.append(req)
+            return _probe_response(_PROBE_HEADERS)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen), \
+             patch("claude_swap.oauth.format_reset", return_value=("1h", "12:00")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@example.com", _setup_token_creds(), is_active=True
+            )
+
+        assert json.loads(seen[0].data)["model"] == "claude-opus-5-5"
+        assert outcome.usage["scoped"][0]["name"] == "Opus"
+
+    def test_refreshable_login_still_uses_the_usage_endpoint(self):
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": 9999999999999, "scopes": ["user:inference", "user:profile"],
+        }})
+        seen = []
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+            {"five_hour": {"utilization": 12.0, "resets_at": None}}
+        ).encode()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+
+        def mock_urlopen(req, timeout=0):
+            seen.append(req)
+            return response
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False
+            )
+
+        assert [r.full_url for r in seen] == ["https://api.anthropic.com/api/oauth/usage"]
+        assert outcome.usage == {"five_hour": {"pct": 12.0}}
+
+    def test_rate_limited_429_with_headers_is_a_usage_reading(self):
+        headers = dict(_PROBE_HEADERS)
+        headers["anthropic-ratelimit-unified-5h-utilization"] = "1.0"
+        err = urllib.error.HTTPError(oauth.MESSAGES_URL, 429, "Too Many", headers, None)
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.format_reset", return_value=("1h", "12:00")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@example.com", _setup_token_creds(), is_active=False
+            )
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 100.0
+
+    def test_429_without_headers_is_an_error_with_retry_after(self):
+        err = urllib.error.HTTPError(
+            oauth.MESSAGES_URL, 429, "Too Many", {"Retry-After": "30"}, None
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@example.com", _setup_token_creds(), is_active=False
+            )
+        assert outcome.usage is None
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 30.0
+
+    def test_revoked_setup_token_reports_401_without_a_refresh_attempt(self):
+        err = urllib.error.HTTPError(oauth.MESSAGES_URL, 401, "Unauthorized", {}, None)
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err) as urlopen:
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@example.com", _setup_token_creds(), is_active=False
+            )
+        assert urlopen.call_count == 1
+        assert outcome.usage is None
+        assert outcome.error == "http-401"
+
+    def test_response_without_ratelimit_headers_yields_no_usage(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=_probe_response({"content-type": "application/json"}),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "3", "a@example.com", _setup_token_creds(), is_active=False
+            )
+        assert outcome.usage is None
+        assert outcome.error is None

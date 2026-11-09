@@ -339,6 +339,17 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
+**Usage for setup-token accounts.** A setup-token is inference-only, so the usage
+endpoint rejects it (HTTP 403). For these accounts cswap reads the same 5-hour,
+weekly and per-model weekly numbers from the rate-limit headers of a one-output-token
+request instead, on the usual polling cadence. Two things differ from a browser login:
+
+- Each poll is a real request (about 35 input tokens and one output token) against
+  that account's own quota.
+- The per-model weekly window is only reported for the model the request targets.
+  The default is `claude-fable-5-2`, shown as `Fable`; set `CSWAP_USAGE_PROBE_MODEL`
+  to another model id to track a different one. Extra-usage spend is not reported.
+
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription
