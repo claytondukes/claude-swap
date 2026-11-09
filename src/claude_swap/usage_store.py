@@ -1178,6 +1178,36 @@ class UsageStore:
         self._mutate(identities, nums, apply)
 
 
+    def forget_reading(
+        self, nums: Iterable[str], identities: dict[str, Identity]
+    ) -> None:
+        """Drop the cached reading and poll plan of slots whose credential was
+        REPLACED by a different one.
+
+        Rows are matched by identity ``(email, organizationUuid)``, and a
+        replacement setup-token or API key for the same email has the same
+        identity, so without this the row keeps serving the reading the OLD
+        credential produced until its old plan comes due (up to
+        ``CANDIDATE_MAX_INTERVAL_S`` for an idle account). A reading belongs
+        to the credential that produced it: when a token turns out to have
+        been issued under another account, the stale numbers are another
+        account's. Clearing the plan with the reading makes the slot
+        fetch-eligible on the next pass; the claim is released so a fetch
+        already in flight with the old credential cannot record over it.
+        """
+        nums = list(nums)
+        if not nums:
+            return
+
+        def apply(_num: str, row: dict) -> None:
+            row["claimId"] = None
+            row["claimUntil"] = 0.0
+            for key in ("lastGood", "fetchedAt", "nextPollAt", "pollIntervalS"):
+                row.pop(key, None)
+
+        self._mutate(identities, nums, apply)
+
+
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 

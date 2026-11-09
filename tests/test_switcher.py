@@ -4895,6 +4895,55 @@ class TestAddAccountFromToken:
         switcher._init_sequence_file()
         return switcher
 
+    def _seed_reading(self, switcher, num, email):
+        """Give a slot a cached reading under a plan that is not yet due."""
+        from claude_swap.usage_store import FetchRecord
+
+        store = switcher._usage_store
+        ident = {num: (email, "")}
+        store.record(
+            {num: FetchRecord(usage={"seven_day": {"pct": 52.0}})}, ident,
+            plans={num: (store.clock() + 450, 450.0)},
+        )
+        return store, ident
+
+    def test_replacing_a_token_forgets_the_old_reading(self, temp_home):
+        """A different token for the same email (same identity) must not keep
+        serving the reading the old token produced."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com")
+        store, ident = self._seed_reading(switcher, "1", "user@example.com")
+
+        switcher.add_account_from_token("sk-ant-oat01-new", "user@example.com")
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good is None
+        assert entry.next_poll_at is None
+
+    def test_replacing_a_token_by_slot_forgets_the_old_reading(self, temp_home):
+        """The --slot path (same email, same slot) clears the reading too."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-old", "user@example.com", slot=3)
+        store, ident = self._seed_reading(switcher, "3", "user@example.com")
+
+        switcher.add_account_from_token(
+            "sk-ant-oat01-new", "user@example.com", slot=3, assume_yes=True
+        )
+
+        assert store.entries(ident)["3"].last_good is None
+
+    def test_re_adding_the_same_token_keeps_its_reading(self, temp_home):
+        """The reading still belongs to the credential: nothing to forget."""
+        switcher = self._make_switcher(temp_home)
+        switcher.add_account_from_token("sk-ant-oat01-same", "user@example.com")
+        store, ident = self._seed_reading(switcher, "1", "user@example.com")
+
+        switcher.add_account_from_token("sk-ant-oat01-same", "user@example.com")
+
+        entry = store.entries(ident)["1"]
+        assert entry.last_good == {"seven_day": {"pct": 52.0}}
+        assert entry.next_poll_at is not None
+
     def test_basic_add_stores_account(self, temp_home, capsys):
         """A valid token + email should store the account and print 'Added'."""
         switcher = self._make_switcher(temp_home)

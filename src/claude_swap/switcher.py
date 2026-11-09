@@ -3631,6 +3631,9 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
+            replaced = self._stored_credential_differs(
+                account_num, email, credentials
+            )
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             # A refreshed credential invalidates any dead-token quarantine on this
@@ -3640,6 +3643,10 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (email, "")}
             )
+            if replaced:
+                self._usage_store.forget_reading(
+                    [account_num], {account_num: (email, "")}
+                )
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -3715,6 +3722,10 @@ class ClaudeAccountSwitcher:
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
 
+        # Read before the write: a slot that already holds this identity under
+        # a DIFFERENT credential keeps its usage row (rows match on identity),
+        # and that row's reading came from the credential being replaced.
+        replaced = self._stored_credential_differs(account_num, email, credentials)
         self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
         # Reusing/overwriting a slot with a fresh credential lifts any dead-token
@@ -3722,6 +3733,10 @@ class ClaudeAccountSwitcher:
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (email, "")}
         )
+        if replaced:
+            self._usage_store.forget_reading(
+                [account_num], {account_num: (email, "")}
+            )
 
         data = self._get_sequence_data()
         record = {
@@ -3747,6 +3762,20 @@ class ClaudeAccountSwitcher:
         print(
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
+        )
+
+    def _stored_credential_differs(
+        self, account_num: str, email: str, credentials: str
+    ) -> bool:
+        """True when the slot already stores a credential other than
+        ``credentials``. False for an empty slot (nothing was replaced) and
+        for a re-add of the same token or key (its reading is still its own).
+        """
+        stored = self._read_account_credentials(account_num, email)
+        if not stored:
+            return False
+        return oauth.credential_fingerprint(stored) != oauth.credential_fingerprint(
+            credentials
         )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:

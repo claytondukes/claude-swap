@@ -1269,6 +1269,41 @@ class TestDeadTokenQuarantine:
         # A dead token is never nominated as the alternate to poll.
         assert due_candidate(["1"], entries, clock.now) is None
 
+    def test_forget_reading_drops_reading_and_plan(self, store, clock):
+        """A replaced credential's reading and schedule go; the slot is
+        fetch-eligible at once instead of when the old plan comes due."""
+        store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT,
+            plans={"1": (clock.now + 450, 450.0)},
+        )
+        # Fresh reading under a future plan: nobody may fetch it yet.
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+        store.forget_reading(["1"], IDENT)
+
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good is None
+        assert entry.fetched_at is None
+        assert entry.next_poll_at is None
+        assert entry.poll_interval_s is None
+        assert "1" in store.reserve(["1"], IDENT, respect_plans=True)
+
+    def test_forget_reading_fences_an_in_flight_fetch(self, store):
+        """A fetch claimed with the old credential cannot record its reading
+        over the cleared row."""
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.forget_reading(["1"], IDENT)
+        accepted = store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims=claims)
+        assert accepted == set()
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_forget_reading_leaves_other_slots_alone(self, store):
+        store.record(
+            {"1": FetchRecord(usage=USAGE), "2": FetchRecord(usage=USAGE)}, IDENT
+        )
+        store.forget_reading(["1"], IDENT)
+        assert store.entries(IDENT)["2"].last_good == USAGE
+
     def test_clear_dead_token_lifts_quarantine(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
